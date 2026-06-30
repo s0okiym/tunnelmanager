@@ -61,9 +61,12 @@ func Relay(a, b net.Conn) Stats {
 }
 
 func closeWrite(c net.Conn) {
-	if tcp, ok := c.(*net.TCPConn); ok {
-		tcp.CloseWrite()
-	} else {
+	switch conn := c.(type) {
+	case *net.TCPConn:
+		conn.CloseWrite()
+	case interface{ CloseWrite() error }:
+		conn.CloseWrite()
+	default:
 		c.Close()
 	}
 }

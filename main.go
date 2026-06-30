@@ -13,12 +13,10 @@ import (
 
 func main() {
 	localF := flag.String("L", "", "Local forwarding: [bind:]port:host:hostport")
-	dynamicF := flag.String("D", "", "Dynamic SOCKS5 proxy (not yet implemented)")
-
-	var (
-		_ = flag.String("R", "", "Remote forwarding (not yet implemented)")
-		_ = flag.String("s", "", "Server address for remote forwarding")
-	)
+	remoteF := flag.String("R", "", "Remote forwarding: [bind:]port:host:hostport")
+	dynamicF := flag.String("D", "", "Dynamic SOCKS5 proxy")
+	serverF := flag.String("s", "", "Server address for remote forwarding")
+	tokenF := flag.String("token", "", "Auth token for remote forwarding")
 	tlsF := flag.Bool("tls", false, "Enable TLS encryption")
 	udpF := flag.Bool("udp", false, "Use UDP instead of TCP")
 
@@ -62,6 +60,10 @@ Flags:
 			runAdhocLocal(*localF, *tlsF, *udpF)
 		case *dynamicF != "":
 			runAdhocDynamic(*dynamicF)
+		case *remoteF != "" && *serverF != "":
+			runAdhocRemote(*remoteF, *serverF, *tokenF, *tlsF)
+		case *remoteF == "" && *serverF != "":
+			runAdhocRemoteServer(*serverF, *tokenF, *tlsF)
 		default:
 			flag.Usage()
 			os.Exit(1)
@@ -127,6 +129,108 @@ func runAdhocLocal(spec string, tls bool, udp bool) {
 	if err := proxy.Serve(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func parseRemoteSpec(spec string) (remotePort uint16, targetAddr string, err error) {
+	// Format: [bind:]port:host:hostport
+	// We only need port:host:hostport (bind is ignored for now, always 0.0.0.0)
+	hostPort := ""
+	for i := len(spec) - 1; i >= 0; i-- {
+		if spec[i] == ':' {
+			if hostPort == "" {
+				hostPort = spec[i+1:]
+				spec = spec[:i]
+			} else {
+				targetAddr = spec[i+1:] + ":" + hostPort
+				spec = spec[:i]
+				break
+			}
+		}
+	}
+	if targetAddr == "" {
+		return 0, "", fmt.Errorf("invalid -R format: %q (expected [bind:]port:host:hostport)", spec+":"+hostPort)
+	}
+	// spec now contains [bind:]port — take the last component as port
+	lastColon := -1
+	for i := len(spec) - 1; i >= 0; i-- {
+		if spec[i] == ':' {
+			lastColon = i
+			break
+		}
+	}
+	portStr := spec
+	if lastColon >= 0 {
+		portStr = spec[lastColon+1:]
+	}
+	var p int
+	for _, c := range portStr {
+		p = p*10 + int(c-'0')
+	}
+	return uint16(p), targetAddr, nil
+}
+
+func runAdhocRemote(remoteSpec, serverAddr, token string, tls bool) {
+	remotePort, targetAddr, err := parseRemoteSpec(remoteSpec)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var tlsCfg *relay.TLSConfig
+	if tls {
+		cert, err := relay.GenerateCert()
+		if err != nil {
+			log.Fatalf("Failed to generate TLS cert: %v", err)
+		}
+		tlsCfg = &relay.TLSConfig{Enabled: true, Cert: cert, Insecure: true}
+	}
+
+	tunnels := []relay.RemoteTunnel{
+		{RemotePort: remotePort, TargetAddr: targetAddr},
+	}
+
+	log.Printf("Remote tunnel: %s:%d -> %s (via %s)", "0.0.0.0", remotePort, targetAddr, serverAddr)
+	client := relay.NewRemoteClient(serverAddr, token, tlsCfg, tunnels)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		log.Print("Shutting down...")
+		client.Close()
+	}()
+
+	client.Run()
+}
+
+func runAdhocRemoteServer(serverAddr, token string, tls bool) {
+	var tlsCfg *relay.TLSConfig
+	if tls {
+		cert, err := relay.GenerateCert()
+		if err != nil {
+			log.Fatalf("Failed to generate TLS cert: %v", err)
+		}
+		tlsCfg = &relay.TLSConfig{Enabled: true, Cert: cert, Insecure: true}
+	}
+
+	srv, err := relay.NewRemoteServer(serverAddr, token, tlsCfg)
+	if err != nil {
+		log.Fatalf("Failed to start remote server: %v", err)
+	}
+
+	log.Printf("Remote server listening on %s", serverAddr)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Printf("Received %v, shutting down...", sig)
+		srv.Close()
+	}()
+
+	if err := srv.Serve(); err != nil {
+		log.Fatal(err)
+	}
+	srv.Wait()
 }
 
 func runAdhocDynamic(portSpec string) {

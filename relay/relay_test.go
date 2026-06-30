@@ -3,10 +3,12 @@ package relay
 import (
 	"bytes"
 	"crypto/rand"
+	"fmt"
 	"io"
 	"net"
 	"sync"
 	"testing"
+	"time"
 )
 
 func randomBytes(n int) []byte {
@@ -655,6 +657,337 @@ func TestSocksConnectRefused(t *testing.T) {
 	}
 	if n < 4 || reply[0] != 5 || reply[1] == 0 {
 		t.Fatalf("expected failure reply, got rep=%d", reply[1])
+	}
+}
+
+// ─── Phase 3: Remote / Frame / CtrlConn tests ───────────────────────────
+
+func TestFrameRoundTrip(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- WriteFrame(a, FramePing, []byte("hello"))
+	}()
+
+	frame, err := ReadFrame(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+	if frame.Type != FramePing || string(frame.Payload) != "hello" {
+		t.Fatalf("got type=%d payload=%q", frame.Type, string(frame.Payload))
+	}
+}
+
+func TestFrameEmptyPayload(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	go WriteFrame(a, FramePong, nil)
+	frame, err := ReadFrame(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frame.Type != FramePong || len(frame.Payload) != 0 {
+		t.Fatal("expected empty pong")
+	}
+}
+
+func TestCtrlConnChannelBasic(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	cca := NewCtrlConn(a)
+	ccb := NewCtrlConn(b)
+
+	ch, err := cca.OpenChannel("localhost:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	accepted, err := ccb.AcceptChannel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if accepted.target != "localhost:8080" {
+		t.Fatalf("target mismatch: %s", accepted.target)
+	}
+
+	// write from server side
+	go accepted.Write([]byte("ping"))
+
+	buf := make([]byte, 4)
+	n, err := ch.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != "ping" {
+		t.Fatalf("got %q", buf[:n])
+	}
+
+	// write from client side
+	ch.Write([]byte("pong"))
+	n, err = accepted.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != "pong" {
+		t.Fatalf("got %q", buf[:n])
+	}
+}
+
+func TestCtrlConnChannelClose(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	cca := NewCtrlConn(a)
+	ccb := NewCtrlConn(b)
+
+	ch, err := cca.OpenChannel("t:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := ccb.AcceptChannel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ch.CloseWrite()
+	buf := make([]byte, 4)
+	n, err := accepted.Read(buf)
+	if err != io.EOF {
+		t.Fatalf("expected EOF after close, got err=%v n=%d", err, n)
+	}
+}
+
+func TestCtrlConnAuth(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- AuthClient(a, "mytoken")
+	}()
+	go func() {
+		errCh <- AuthServer(b, "mytoken")
+	}()
+
+	for range 2 {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCtrlConnAuthReject(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- AuthClient(a, "wrong")
+	}()
+	go func() {
+		errCh <- AuthServer(b, "expected")
+	}()
+
+	clientErr := <-errCh
+	serverErr := <-errCh
+	if clientErr == nil || serverErr == nil {
+		t.Fatal("expected auth failure")
+	}
+}
+
+func TestCtrlConnRegister(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	tunnels := []RemoteTunnel{
+		{RemotePort: 9090, TargetAddr: "localhost:8080"},
+		{RemotePort: 9091, TargetAddr: "127.0.0.1:3000"},
+	}
+
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- RegisterClient(a, tunnels)
+	}()
+	go func() {
+		got, err := RegisterServer(b)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		if len(got) != 2 {
+			errCh <- fmt.Errorf("expected 2 tunnels, got %d", len(got))
+			return
+		}
+		if got[0].RemotePort != 9090 || got[0].TargetAddr != "localhost:8080" {
+			errCh <- fmt.Errorf("tunnel 0 mismatch: %+v", got[0])
+			return
+		}
+		if got[1].RemotePort != 9091 || got[1].TargetAddr != "127.0.0.1:3000" {
+			errCh <- fmt.Errorf("tunnel 1 mismatch: %+v", got[1])
+			return
+		}
+		errCh <- nil
+	}()
+
+	for range 2 {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestRemoteE2E(t *testing.T) {
+	localLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localLn.Close()
+
+	done := make(chan struct{}, 1)
+	go echoFunc(localLn, done)
+
+	srv, err := NewRemoteServer("127.0.0.1:0", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	defer srv.Close()
+
+	// find a free port for the remote listener
+	remoteLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	remotePort := uint16(remoteLn.Addr().(*net.TCPAddr).Port)
+	remoteLn.Close()
+
+	tunnels := []RemoteTunnel{
+		{RemotePort: remotePort, TargetAddr: localLn.Addr().String()},
+	}
+	client := NewRemoteClient(srv.ctrlLn.Addr().String(), "", nil, tunnels)
+
+	go func() {
+		client.Run()
+	}()
+	defer client.Close()
+
+	time.Sleep(300 * time.Millisecond)
+
+	// connect to the remote port
+	payload := randomBytes(5000)
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", remotePort))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn.Write(payload)
+	halfCloseTCP(conn)
+
+	got, err := io.ReadAll(conn)
+	conn.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("remote e2e: got %d bytes, want %d", len(got), len(payload))
+	}
+}
+
+func TestBackoffDelay(t *testing.T) {
+	cfg := BackoffConfig{
+		BaseDelay:   time.Second,
+		MaxDelay:    10 * time.Second,
+		JitterRatio: 0,
+	}
+
+	// without jitter, should be deterministic
+	d0 := BackoffDelay(cfg, 0)
+	if d0 != time.Second {
+		t.Fatalf("attempt 0: want 1s, got %v", d0)
+	}
+
+	d1 := BackoffDelay(cfg, 1)
+	if d1 != 2*time.Second {
+		t.Fatalf("attempt 1: want 2s, got %v", d1)
+	}
+
+	d4 := BackoffDelay(cfg, 4)
+	if d4 != 10*time.Second {
+		t.Fatalf("attempt 4: want 10s (capped), got %v", d4)
+	}
+
+	d10 := BackoffDelay(cfg, 10)
+	if d10 != 10*time.Second {
+		t.Fatalf("attempt 10: want 10s (capped), got %v", d10)
+	}
+}
+
+func TestTLSCertGenerate(t *testing.T) {
+	cert, err := GenerateCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cert.Certificate) == 0 {
+		t.Fatal("no cert generated")
+	}
+}
+
+func TestTLSConnection(t *testing.T) {
+	cert, err := GenerateCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &TLSConfig{Enabled: true, Cert: cert, Insecure: true}
+
+	ln, err := TLSListener("127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	payload := randomBytes(10000)
+
+	go func() {
+		conn, aErr := ln.Accept()
+		if aErr != nil {
+			return
+		}
+		io.Copy(conn, conn)
+		conn.Close()
+	}()
+
+	conn, err := TLSDial(ln.Addr().String(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	conn.Write(payload)
+	closeWrite(conn)
+
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("tls echo: got %d bytes, want %d", len(got), len(payload))
 	}
 }
 
