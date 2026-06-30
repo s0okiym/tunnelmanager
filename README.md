@@ -1,44 +1,44 @@
 # Tunnel Manager
 
-A lightweight, high-performance port forwarding tool. Single binary, zero dependencies.
+轻量、高性能的端口转发工具。单二进制，零外部依赖。
 
-## Quick start
+## 快速开始
 
 ```bash
-# Local port forwarding (like ssh -L)
+# 本地端口转发（类似 ssh -L）
 tunnel -L 3306:db.internal:3306
 
-# With bind address
+# 指定绑定地址
 tunnel -L 127.0.0.1:3306:db.internal:3306
 
-# Multiple tunnels
+# 多条转发
 tunnel -L 3306:db:3306 -L 8080:web:80
 
-# Ctrl+C to stop
+# Ctrl+C 停止
 ```
 
-## Features
+## 功能
 
-- **Local forwarding** (`-L`) — forward a local port to a remote target
-- **Half-close semantics** — correct bidirectional relay without deadlocks
-- **Buffer pool** — 32KB buffers per direction, reused via `sync.Pool`
-- **Signal handling** — graceful shutdown on SIGINT/SIGTERM
-- **No dependencies** — pure Go standard library
+- **本地转发**（`-L`）— 将本地端口转发到远程目标
+- **半关闭语义** — 正确的双向转发，无死锁
+- **缓冲池** — 每方向 32KB 缓冲区，通过 `sync.Pool` 复用
+- **信号处理** — SIGINT/SIGTERM 优雅退出
+- **纯标准库** — 仅使用 Go 标准库，零依赖
 
-### Planned
+### 规划中
 
-- SOCKS5 dynamic proxy (`-D`)
-- Remote reverse forwarding (`-R`) for NAT penetration
-- TLS 1.3 encryption with auto-generated certificates
-- Daemon mode with YAML config management
+- SOCKS5 动态代理（`-D`）
+- 远程反向转发（`-R`）用于 NAT 穿透
+- TLS 1.3 加密 + 自动证书
+- Daemon 模式 + YAML 配置管理
 
-## Install
+## 安装
 
 ```bash
 go install github.com/s0okiym/tunnelmanager@latest
 ```
 
-Or build from source:
+或从源码构建：
 
 ```bash
 git clone https://github.com/s0okiym/tunnelmanager.git
@@ -46,17 +46,17 @@ cd tunnelmanager
 go build -o tunnel .
 ```
 
-## Usage
+## 使用
 
 ```
-tunnel -L [bind:]port:host:hostport    Local forwarding
+tunnel -L [bind:]port:host:hostport    本地端口转发
 ```
 
-| Argument | Description |
-|----------|-------------|
-| `-L [bind:]port:host:hostport` | Listen on `bind:port`, forward to `host:hostport` |
+| 参数 | 说明 |
+|------|------|
+| `-L [bind:]port:host:hostport` | 监听 `bind:port`，转发到 `host:hostport` |
 
-## Development
+## 开发
 
 ```bash
 go test -race -count=1 ./...
