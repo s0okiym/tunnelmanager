@@ -13,10 +13,10 @@ import (
 
 func main() {
 	localF := flag.String("L", "", "Local forwarding: [bind:]port:host:hostport")
+	dynamicF := flag.String("D", "", "Dynamic SOCKS5 proxy (not yet implemented)")
 
 	var (
 		_ = flag.String("R", "", "Remote forwarding (not yet implemented)")
-		_ = flag.String("D", "", "Dynamic SOCKS5 proxy (not yet implemented)")
 		_ = flag.String("s", "", "Server address for remote forwarding")
 	)
 	tlsF := flag.Bool("tls", false, "Enable TLS encryption")
@@ -57,9 +57,12 @@ Flags:
 	default:
 		// Parse flags from os.Args[1:] since first arg isn't a subcommand
 		flag.CommandLine.Parse(os.Args[1:])
-		if *localF != "" {
+		switch {
+		case *localF != "":
 			runAdhocLocal(*localF, *tlsF, *udpF)
-		} else {
+		case *dynamicF != "":
+			runAdhocDynamic(*dynamicF)
+		default:
 			flag.Usage()
 			os.Exit(1)
 		}
@@ -114,6 +117,30 @@ func runAdhocLocal(spec string, tls bool, udp bool) {
 	if err != nil {
 		log.Fatalf("Failed to start proxy: %v", err)
 	}
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Printf("Received %v, shutting down...", sig)
+		proxy.Close()
+	}()
+	if err := proxy.Serve(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runAdhocDynamic(portSpec string) {
+	listenAddr := portSpec
+	if portSpec[0] != ':' {
+		listenAddr = "127.0.0.1:" + portSpec
+	}
+
+	log.Printf("SOCKS5 proxy on %s", listenAddr)
+	proxy, err := relay.NewSocksProxy(listenAddr)
+	if err != nil {
+		log.Fatalf("Failed to start SOCKS proxy: %v", err)
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
