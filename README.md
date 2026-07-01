@@ -218,6 +218,30 @@ ssh -o ProxyCommand='nc -x 127.0.0.1:1080 %h %p' user@target
 tunnel -L 8080:web.internal:80 --tls
 ```
 
+工作流程：
+
+```
+[客户端] --TLS 1.3 加密--> [tunnel -L --tls :8080] --明文 TCP--> [web.internal:80]
+```
+
+- tunnel 监听 `:8080` 时使用 TLS 1.3 加密（`tls.Listen`）
+- 客户端必须用 TLS 连接 `localhost:8080`（如 `curl --https` 或 `openssl s_client`）
+- tunnel 解密后通过普通 TCP 转发到目标
+- 返回路径相反：目标明文 → tunnel 加密 → 客户端
+
+快速验证（本地 echo 服务）：
+
+```bash
+# 终端1：用 nc 起一个 TCP echo 服务器
+echo "hello" | nc -l -p 9999 &
+
+# 终端2：启动 TLS 隧道，转发 9998 -> 9999
+tunnel -L 9998:127.0.0.1:9999 --tls
+
+# 终端3：用 openssl 以 TLS 连接隧道
+echo "hello" | openssl s_client -connect 127.0.0.1:9998 -quiet
+```
+
 ### 远程转发 + TLS
 
 服务端：
@@ -234,9 +258,11 @@ tunnel -R 9090:localhost:8080 -s server.example.com:9000 --tls --token mytoken
 
 ### TLS 配置说明
 
-- 使用 TLS 1.3（最高安全版本，仅一个加密套件）
-- 证书自签名，有效期 1 年
+- 使用 TLS 1.3（最高安全版本，仅一个加密套件，完美前向安全性）
+- 证书自签名（ECDSA P-256），每次启动自动生成，有效期 1 年
 - 客户端默认 `InsecureSkipVerify = true`（自签名证书跳过验证）
+- 本地转发（`-L --tls`）和远程转发（`-R --tls` + `-s --tls`）均支持
+- 加密段仅在"客户端 ↔ tunnel"之间，tunnel → 目标为明文 TCP
 
 ---
 

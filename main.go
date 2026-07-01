@@ -383,15 +383,22 @@ func runAdhocLocal(spec string, tls bool, udp bool) {
 	if udp {
 		log.Fatal("UDP forwarding not yet implemented")
 	}
-	if tls {
-		log.Print("TLS mode requested, using plain TCP for now (TLS coming in Phase 3)")
-	}
 	listenAddr, dialAddr, err := parseLocalSpec(spec)
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("Listening on %s, forwarding to %s", listenAddr, dialAddr)
-	proxy, err := relay.NewProxy(listenAddr, dialAddr)
+	var proxy *relay.Proxy
+	if tls {
+		cert, err := relay.GenerateCert()
+		if err != nil {
+			log.Fatalf("Failed to generate TLS cert: %v", err)
+		}
+		tlsCfg := &relay.TLSConfig{Enabled: true, Cert: cert, Insecure: true}
+		proxy, err = relay.NewTLSProxy(listenAddr, dialAddr, tlsCfg)
+	} else {
+		proxy, err = relay.NewProxy(listenAddr, dialAddr)
+	}
 	if err != nil {
 		log.Fatalf("Failed to start proxy: %v", err)
 	}

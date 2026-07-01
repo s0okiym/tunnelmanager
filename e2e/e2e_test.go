@@ -689,6 +689,57 @@ func TestE2ETLSEcho(t *testing.T) {
 	}
 }
 
+func TestE2ELocalProxyTLS(t *testing.T) {
+	cert, err := relay.GenerateCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsCfg := &relay.TLSConfig{Enabled: true, Cert: cert, Insecure: true}
+
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			conn, aErr := echoLn.Accept()
+			if aErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				io.Copy(c, c)
+				c.Close()
+			}(conn)
+		}
+	}()
+
+	proxy, err := relay.NewTLSProxy("127.0.0.1:0", echoLn.Addr().String(), tlsCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go proxy.Serve()
+	defer proxy.Close()
+
+	conn, err := relay.TLSDial(proxy.Addr().String(), tlsCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	payload := randomBytes(10000)
+	conn.Write(payload)
+	halfCloseTCP(conn)
+
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("tls proxy: got %d bytes, want %d", len(got), len(payload))
+	}
+}
+
 // ─── Helper: find a free port ────────────────────────────────────────────
 
 func findFreePort(t *testing.T) uint16 {

@@ -28,6 +28,18 @@ func NewProxy(listenAddr, dialAddr string) (*Proxy, error) {
 	}, nil
 }
 
+func NewTLSProxy(listenAddr, dialAddr string, tlsCfg *TLSConfig) (*Proxy, error) {
+	l, err := TLSListener(listenAddr, tlsCfg)
+	if err != nil {
+		return nil, err
+	}
+	return &Proxy{
+		listener: l,
+		dialAddr: dialAddr,
+		done:     make(chan struct{}),
+	}, nil
+}
+
 func (p *Proxy) Addr() net.Addr {
 	return p.listener.Addr()
 }
