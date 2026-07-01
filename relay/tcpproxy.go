@@ -2,6 +2,7 @@ package relay
 
 import (
 	"net"
+	"sync"
 	"sync/atomic"
 )
 
@@ -10,6 +11,9 @@ type Proxy struct {
 	dialAddr  string
 	done      chan struct{}
 	closed    atomic.Bool
+	mu        sync.Mutex
+	stats     Stats
+	connCount atomic.Int64
 }
 
 func NewProxy(listenAddr, dialAddr string) (*Proxy, error) {
@@ -50,7 +54,25 @@ func (p *Proxy) handle(downstream net.Conn) {
 	}
 	defer upstream.Close()
 
-	Relay(upstream, downstream)
+	p.connCount.Add(1)
+	s := Relay(upstream, downstream)
+
+	p.mu.Lock()
+	p.stats.SentBytes += s.SentBytes
+	p.stats.RecvBytes += s.RecvBytes
+	if s.SentErr != nil {
+		p.stats.SentErr = s.SentErr
+	}
+	if s.RecvErr != nil {
+		p.stats.RecvErr = s.RecvErr
+	}
+	p.mu.Unlock()
+}
+
+func (p *Proxy) Stats() Stats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.stats
 }
 
 func (p *Proxy) Close() error {

@@ -25,7 +25,8 @@ type TunnelStatus struct {
 	Mode   string `json:"mode"`
 	Local  string `json:"local"`
 	Remote string `json:"remote"`
-	Status string `json:"status"` // running, stopped, error
+	Status string `json:"status"`
+	Group  string `json:"group,omitempty"`
 	Error  string `json:"error,omitempty"`
 }
 

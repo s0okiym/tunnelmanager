@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"tunnel/relay"
 )
@@ -34,10 +35,13 @@ func NewManager(cfg *Config, cfgPath string) *Manager {
 func (m *Manager) Start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.startLocked()
+}
 
+func (m *Manager) startLocked() error {
 	for _, tc := range m.cfg.Tunnels {
 		if tc.Autostart {
-			if err := m.startLocked(tc); err != nil {
+			if err := m.startOne(tc); err != nil {
 				log.Printf("manager: failed to start %s: %v", tc.Name, err)
 			}
 		}
@@ -48,11 +52,44 @@ func (m *Manager) Start() error {
 func (m *Manager) Stop() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.stopLocked()
+}
 
+func (m *Manager) stopLocked() error {
 	for name, mt := range m.tunnels {
 		mt.cancel()
 		delete(m.tunnels, name)
 		log.Printf("manager: stopped %s", name)
+	}
+	return nil
+}
+
+func (m *Manager) StopGroup(group string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for name, mt := range m.tunnels {
+		if mt.cfg.Group == group {
+			mt.cancel()
+			delete(m.tunnels, name)
+			log.Printf("manager: stopped %s (group %s)", name, group)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) StartGroup(group string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, tc := range m.cfg.Tunnels {
+		if tc.Group == group {
+			if _, running := m.tunnels[tc.Name]; !running {
+				if err := m.startOne(tc); err != nil {
+					log.Printf("manager: failed to start %s (group %s): %v", tc.Name, group, err)
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -69,6 +106,7 @@ func (m *Manager) List() []TunnelStatus {
 			Mode:   tc.Mode,
 			Local:  tc.Local,
 			Remote: tc.Remote,
+			Group:  tc.Group,
 		}
 		if running {
 			st.Status = "running"
@@ -94,7 +132,7 @@ func (m *Manager) Add(tc TunnelConfig) error {
 	}
 
 	if tc.Autostart {
-		return m.startLocked(tc)
+		return m.startOne(tc)
 	}
 	return nil
 }
@@ -116,17 +154,39 @@ func (m *Manager) Remove(name string) error {
 	return SaveConfig(m.cfg, m.cfgPath)
 }
 
-func (m *Manager) startLocked(tc TunnelConfig) error {
+func (m *Manager) findConfig(name string) int {
+	for i, tc := range m.cfg.Tunnels {
+		if tc.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m *Manager) startOne(tc TunnelConfig) error {
+	if _, exists := m.tunnels[tc.Name]; exists {
+		return nil // already running
+	}
+
 	ctx := make(chan struct{})
+	cancel := func() { close(ctx) }
 
 	switch tc.Mode {
 	case "local":
-		go m.runLocal(tc, ctx)
+		if len(tc.Hops) > 0 {
+			go m.runChain(tc, ctx)
+		} else {
+			go m.runLocal(tc, ctx)
+		}
 	case "dynamic":
 		go m.runDynamic(tc, ctx)
 	case "remote":
 		if tc.Server != "" {
-			go m.runRemoteClient(tc, ctx)
+			if tc.Connections > 1 {
+				go m.runRemoteClientMulti(tc, ctx)
+			} else {
+				go m.runRemoteClient(tc, ctx)
+			}
 		} else {
 			go m.runRemoteServer(tc, ctx)
 		}
@@ -134,7 +194,21 @@ func (m *Manager) startLocked(tc TunnelConfig) error {
 		return fmt.Errorf("unknown mode %q", tc.Mode)
 	}
 
-	m.tunnels[tc.Name] = &managedTunnel{cfg: tc, cancel: func() { close(ctx) }}
+	m.tunnels[tc.Name] = &managedTunnel{cfg: tc, cancel: cancel}
+
+	// Start health check if configured
+	if tc.HealthCheck != "" {
+		d, err := time.ParseDuration(tc.HealthCheck)
+		if err == nil {
+			stopHC := make(chan struct{})
+			go relay.HealthCheck(tc.Local, d, 3, stopHC)
+			go func() {
+				<-ctx
+				close(stopHC)
+			}()
+		}
+	}
+
 	return nil
 }
 
@@ -142,6 +216,28 @@ func (m *Manager) runLocal(tc TunnelConfig, stop <-chan struct{}) {
 	proxy, err := relay.NewProxy(tc.Local, tc.Remote)
 	if err != nil {
 		log.Printf("manager: %s: proxy failed: %v", tc.Name, err)
+		return
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- proxy.Serve()
+	}()
+
+	select {
+	case <-stop:
+		proxy.Close()
+	case <-errCh:
+	}
+}
+
+func (m *Manager) runChain(tc TunnelConfig, stop <-chan struct{}) {
+	proxy, err := relay.NewChainProxy(tc.Local, tc.Hops)
+	if err != nil {
+		log.Printf("manager: %s: chain proxy failed: %v", tc.Name, err)
+		return
+	}
+	if proxy == nil {
 		return
 	}
 
@@ -187,7 +283,6 @@ func (m *Manager) runRemoteClient(tc TunnelConfig, stop <-chan struct{}) {
 		tlsCfg = &relay.TLSConfig{Enabled: true, Cert: cert, Insecure: true}
 	}
 
-	// parse Remote spec: "9090:localhost:8080"
 	port, target := parseRemoteSpec(tc.Remote)
 	tunnels := []relay.RemoteTunnel{
 		{RemotePort: port, TargetAddr: target},
@@ -201,6 +296,40 @@ func (m *Manager) runRemoteClient(tc TunnelConfig, stop <-chan struct{}) {
 
 	<-stop
 	client.Close()
+}
+
+func (m *Manager) runRemoteClientMulti(tc TunnelConfig, stop <-chan struct{}) {
+	var tlsCfg *relay.TLSConfig
+	if tc.TLS {
+		cert, err := relay.GenerateCert()
+		if err != nil {
+			log.Printf("manager: %s: tls cert: %v", tc.Name, err)
+			return
+		}
+		tlsCfg = &relay.TLSConfig{Enabled: true, Cert: cert, Insecure: true}
+	}
+
+	port, target := parseRemoteSpec(tc.Remote)
+	tunnel := relay.RemoteTunnel{RemotePort: port, TargetAddr: target}
+
+	n := tc.Connections
+	if n < 1 {
+		n = 1
+	}
+	if n > 10 {
+		n = 10
+	}
+
+	clients := make([]*relay.RemoteClient, n)
+	for i := range n {
+		clients[i] = relay.NewRemoteClient(tc.Server, tc.Token, tlsCfg, []relay.RemoteTunnel{tunnel})
+		go clients[i].Run()
+	}
+
+	<-stop
+	for _, c := range clients {
+		c.Close()
+	}
 }
 
 func (m *Manager) runRemoteServer(tc TunnelConfig, stop <-chan struct{}) {
@@ -232,18 +361,7 @@ func (m *Manager) runRemoteServer(tc TunnelConfig, stop <-chan struct{}) {
 	}
 }
 
-func (m *Manager) findConfig(name string) int {
-	for i, tc := range m.cfg.Tunnels {
-		if tc.Name == name {
-			return i
-		}
-	}
-	return -1
-}
-
-// parseRemoteSpec extracts port and target from "port:host:hostport" format.
 func parseRemoteSpec(spec string) (uint16, string) {
-	// Format: port:host:hostport
 	hostPort := ""
 	for i := len(spec) - 1; i >= 0; i-- {
 		if spec[i] == ':' {
@@ -253,7 +371,6 @@ func parseRemoteSpec(spec string) (uint16, string) {
 			} else {
 				target := spec[i+1:] + ":" + hostPort
 				spec = spec[:i]
-				// parse port
 				var port uint16
 				for _, c := range spec {
 					port = port*10 + uint16(c-'0')
@@ -265,7 +382,6 @@ func parseRemoteSpec(spec string) (uint16, string) {
 	return 0, spec + ":" + hostPort
 }
 
-// HandleControl processes a control request.
 func (m *Manager) HandleControl(req Request) Response {
 	var empty = json.RawMessage("null")
 
@@ -283,6 +399,26 @@ func (m *Manager) HandleControl(req Request) Response {
 		if err != nil {
 			return Response{Error: err.Error(), ID: req.ID}
 		}
+		return Response{Result: empty, ID: req.ID}
+
+	case "stop-group":
+		var params struct {
+			Group string `json:"group"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return Response{Error: fmt.Sprintf("invalid params: %v", err), ID: req.ID}
+		}
+		m.StopGroup(params.Group)
+		return Response{Result: empty, ID: req.ID}
+
+	case "start-group":
+		var params struct {
+			Group string `json:"group"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return Response{Error: fmt.Sprintf("invalid params: %v", err), ID: req.ID}
+		}
+		m.StartGroup(params.Group)
 		return Response{Result: empty, ID: req.ID}
 
 	case "add":
@@ -305,6 +441,16 @@ func (m *Manager) HandleControl(req Request) Response {
 		if err := m.Remove(params.Name); err != nil {
 			return Response{Error: err.Error(), ID: req.ID}
 		}
+		return Response{Result: empty, ID: req.ID}
+
+	case "reload":
+		newCfg, err := LoadConfig(m.cfgPath)
+		if err != nil {
+			return Response{Error: fmt.Sprintf("reload config: %v", err), ID: req.ID}
+		}
+		m.stopLocked()
+		m.cfg = newCfg
+		m.startLocked()
 		return Response{Result: empty, ID: req.ID}
 
 	default:

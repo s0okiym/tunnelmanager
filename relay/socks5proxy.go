@@ -3,13 +3,17 @@ package relay
 import (
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 )
 
 type SocksProxy struct {
-	listener net.Listener
-	done     chan struct{}
-	closed   atomic.Bool
+	listener  net.Listener
+	done      chan struct{}
+	closed    atomic.Bool
+	mu        sync.Mutex
+	stats     Stats
+	connCount atomic.Int64
 }
 
 func NewSocksProxy(listenAddr string) (*SocksProxy, error) {
@@ -55,30 +59,30 @@ func (p *SocksProxy) handle(conn net.Conn) {
 	}
 	defer upstream.Close()
 
-	// reply with success — bind address is "0.0.0.0:0" (unused for connect)
 	rawAddr := packedAddr(upstream.LocalAddr())
 	if err := socksReply(conn, socksRepSuccess, rawAddr[0], rawAddr[1:len(rawAddr)-2], rawAddr[len(rawAddr)-2:]); err != nil {
 		return
 	}
 
-	Relay(upstream, conn)
+	p.connCount.Add(1)
+	s := Relay(upstream, conn)
+
+	p.mu.Lock()
+	p.stats.SentBytes += s.SentBytes
+	p.stats.RecvBytes += s.RecvBytes
+	if s.SentErr != nil {
+		p.stats.SentErr = s.SentErr
+	}
+	if s.RecvErr != nil {
+		p.stats.RecvErr = s.RecvErr
+	}
+	p.mu.Unlock()
 }
 
-// packedAddr returns atyp+addr+port for the given address, usable in SOCKS replies.
-func packedAddr(addr net.Addr) []byte {
-	tcp := addr.(*net.TCPAddr)
-	ip := tcp.IP
-	port := make([]byte, 2)
-	port[0] = byte(tcp.Port >> 8)
-	port[1] = byte(tcp.Port)
-
-	if ip4 := ip.To4(); ip4 != nil {
-		return append([]byte{socksAtypIPv4}, append(ip4, port...)...)
-	}
-	if ip16 := ip.To16(); ip16 != nil {
-		return append([]byte{socksAtypIPv6}, append(ip16, port...)...)
-	}
-	return append([]byte{socksAtypIPv4}, append([]byte{0, 0, 0, 0}, port...)...)
+func (p *SocksProxy) Stats() Stats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.stats
 }
 
 func (p *SocksProxy) Close() error {
@@ -96,4 +100,20 @@ func ListenSocks(addr string) (net.Listener, error) {
 		return nil, fmt.Errorf("socks listen: %w", err)
 	}
 	return l, nil
+}
+
+func packedAddr(addr net.Addr) []byte {
+	tcp := addr.(*net.TCPAddr)
+	ip := tcp.IP
+	port := make([]byte, 2)
+	port[0] = byte(tcp.Port >> 8)
+	port[1] = byte(tcp.Port)
+
+	if ip4 := ip.To4(); ip4 != nil {
+		return append([]byte{socksAtypIPv4}, append(ip4, port...)...)
+	}
+	if ip16 := ip.To16(); ip16 != nil {
+		return append([]byte{socksAtypIPv6}, append(ip16, port...)...)
+	}
+	return append([]byte{socksAtypIPv4}, append([]byte{0, 0, 0, 0}, port...)...)
 }

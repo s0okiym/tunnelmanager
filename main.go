@@ -26,20 +26,26 @@ func main() {
 		fmt.Fprintf(os.Stderr, `Tunnel - port forwarding tool
 
 Usage:
-  tunnel -L [bind:]port:host:hostport    Local forwarding (ad-hoc)
-  tunnel -R port:host:hostport -s addr   Remote forwarding (ad-hoc)
-  tunnel -D port                         Dynamic SOCKS5 proxy (ad-hoc)
-  tunnel start [--background]            Start daemon (managed mode)
-  tunnel stop                            Stop daemon
-  tunnel ls                              List tunnels
-  tunnel add -L ... [--name X]           Add tunnel
-  tunnel rm <name>                       Remove tunnel
+  tunnel -L [bind:]port:host:hostport       Local forwarding (ad-hoc)
+  tunnel -R port:host:hostport -s addr      Remote forwarding (ad-hoc)
+  tunnel -D port                            Dynamic SOCKS5 proxy (ad-hoc)
+  tunnel start [--background]               Start daemon (managed mode)
+  tunnel stop                               Stop daemon
+  tunnel ls                                 List tunnels
+  tunnel add -L/-R/-D ... [--name X]        Add tunnel
+  tunnel rm <name>                          Remove tunnel
+  tunnel reload                             Reload config
+  tunnel start-group <group>                Start all tunnels in group
+  tunnel stop-group <group>                 Stop all tunnels in group
+  tunnel init --systemd                     Generate systemd unit
 
 Examples:
   tunnel -L 3306:db.internal:3306
   tunnel -R 9090:localhost:8080 -s server.example.com:9000
   tunnel -D 1080
   tunnel start --background
+  tunnel add -L 8080:web:80 --name web
+  tunnel init --systemd | sudo tee /etc/systemd/system/tunnel.service
 
 Flags:
 `)
@@ -62,6 +68,14 @@ Flags:
 		cmdAdd()
 	case "rm", "remove":
 		cmdRemove()
+	case "init":
+		cmdInit()
+	case "reload":
+		cmdReload()
+	case "start-group":
+		cmdStartGroup()
+	case "stop-group":
+		cmdStopGroup()
 	default:
 		flag.CommandLine.Parse(os.Args[1:])
 		switch {
@@ -203,6 +217,57 @@ func cmdRemove() {
 		log.Fatalf("remove: %v", err)
 	}
 	fmt.Printf("Tunnel %q removed.\n", name)
+}
+
+// ─── New commands ───────────────────────────────────────────────────
+
+func cmdInit() {
+	subFlags := flag.NewFlagSet("init", flag.ExitOnError)
+	systemd := subFlags.Bool("systemd", false, "Generate systemd unit")
+	systemdUser := subFlags.Bool("systemd-user", false, "Generate user systemd unit")
+	subFlags.Parse(os.Args[2:])
+
+	switch {
+	case *systemd:
+		fmt.Print(manager.GenerateSystemdUnit())
+	case *systemdUser:
+		manager.WriteSystemdUnitUser("")
+		fmt.Println("Wrote tunnel.service to ~/.config/systemd/user/")
+	default:
+		fmt.Println(manager.SystemdInstallHint())
+	}
+}
+
+func cmdReload() {
+	_, err := manager.SendControl("reload", nil)
+	if err != nil {
+		log.Fatalf("reload: %v", err)
+	}
+	fmt.Println("Config reloaded.")
+}
+
+func cmdStartGroup() {
+	if len(os.Args) < 3 {
+		log.Fatal("usage: tunnel start-group <group>")
+	}
+	group := os.Args[2]
+	_, err := manager.SendControl("start-group", map[string]string{"group": group})
+	if err != nil {
+		log.Fatalf("start-group: %v", err)
+	}
+	fmt.Printf("Group %q started.\n", group)
+}
+
+func cmdStopGroup() {
+	if len(os.Args) < 3 {
+		log.Fatal("usage: tunnel stop-group <group>")
+	}
+	group := os.Args[2]
+	_, err := manager.SendControl("stop-group", map[string]string{"group": group})
+	if err != nil {
+		log.Fatalf("stop-group: %v", err)
+	}
+	fmt.Printf("Group %q stopped.\n", group)
 }
 
 // ─── Daemon runner ───────────────────────────────────────────────────

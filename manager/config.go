@@ -23,15 +23,19 @@ type Config struct {
 }
 
 type TunnelConfig struct {
-	Name      string `yaml:"name"`
-	Mode      string `yaml:"mode"`                // local, remote, dynamic
-	Local     string `yaml:"local,omitempty"`     // local addr or target
-	Remote    string `yaml:"remote,omitempty"`    // remote target or server listen port
-	Server    string `yaml:"server,omitempty"`    // server addr (remote client mode)
-	Token     string `yaml:"token,omitempty"`     // auth token
-	TLS       bool   `yaml:"tls,omitempty"`       // TLS enabled
-	Protocol  string `yaml:"protocol,omitempty"`  // tcp (default) or udp
-	Autostart bool   `yaml:"autostart,omitempty"` // start on daemon launch
+	Name      string   `yaml:"name"`
+	Mode      string   `yaml:"mode"`                // local, remote, dynamic
+	Local     string   `yaml:"local,omitempty"`     // local addr or target
+	Remote    string   `yaml:"remote,omitempty"`    // remote target or server listen port
+	Server    string   `yaml:"server,omitempty"`    // server addr (remote client mode)
+	Token     string   `yaml:"token,omitempty"`     // auth token
+	TLS       bool     `yaml:"tls,omitempty"`       // TLS enabled
+	Protocol  string   `yaml:"protocol,omitempty"`  // tcp (default) or udp
+	Autostart bool     `yaml:"autostart,omitempty"` // start on daemon launch
+	Group     string   `yaml:"group,omitempty"`     // connection group
+	Hops      []string `yaml:"hops,omitempty"`      // multi-hop chain
+	Connections int    `yaml:"connections,omitempty"` // multi-control connections (remote)
+	HealthCheck string `yaml:"health_check,omitempty"` // health check interval (e.g. "10s")
 }
 
 type GlobalConfig struct {

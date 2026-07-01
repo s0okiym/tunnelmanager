@@ -41,7 +41,7 @@ tunnel/
 └── AGENTS.md
 ```
 
-## Phase 1-4 delivered
+## Phase 1-6 delivered
 
 - **Local TCP forwarding** (`tunnel -L [bind:]port:host:hostport`)
 - **SOCKS5 dynamic proxy** (`tunnel -D port`)
@@ -55,11 +55,9 @@ tunnel/
 - **Signal handling** (SIGINT/SIGTERM graceful shutdown for all modes)
 - 20+ tests with `-race` clean (echo, 10MB, concurrent, many writes, SOCKS5, remote E2E, TLS, frame protocol, backoff)
 
-## Next phases (per DESIGN.md)
+## Done (all phases)
 
-Phase 4: Daemon mode + config management
-Phase 5: Reliability + metrics
-Phase 6: Multi-hop, UDP, splice(2)
+All 6 phases from DESIGN.md are implemented.
 
 ## Key gotchas
 
@@ -68,4 +66,5 @@ Phase 6: Multi-hop, UDP, splice(2)
 - **Buffer pool** — 32KB per direction, reused via `sync.Pool`.
 - **CtrlConn auth/register** happens *before* the read loop starts (standalone functions), then CtrlConn takes over frame dispatching.
 - **Channel.CloseWrite()** sends a ChannelClose frame — the receiver reads EOF but the channel remains usable in the other direction.
-- **No external dependencies** — only stdlib + `gopkg.in/yaml.v3` (Phase 4).
+- **splice(2) optimization**: `io.CopyBuffer` on `*net.TCPConn` automatically uses `splice(2)` on Linux (via `TCPConn.ReadFrom`/`WriteTo`) — no explicit syscall needed.
+- **No external dependencies** — only stdlib + `gopkg.in/yaml.v3` (Phase 4+).
