@@ -22,35 +22,92 @@ func main() {
 	tlsF := flag.Bool("tls", false, "Enable TLS encryption")
 	tlsCertF := flag.String("tls-cert", "", "TLS certificate file (PEM)")
 	tlsKeyF := flag.String("tls-key", "", "TLS key file (PEM)")
+	tlsVerifyF := flag.Bool("tls-verify", false, "Verify TLS peer certificate (requires trusted CA)")
 	udpF := flag.Bool("udp", false, "Use UDP instead of TCP")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Tunnel - port forwarding tool
 
-Usage:
-  tunnel -L [bind:]port:host:hostport       Local forwarding (ad-hoc)
-  tunnel -R port:host:hostport -s addr      Remote forwarding (ad-hoc)
-  tunnel -D port                            Dynamic SOCKS5 proxy (ad-hoc)
-  tunnel start [--background]               Start daemon (managed mode)
-  tunnel stop                               Stop daemon
-  tunnel ls                                 List tunnels
-  tunnel add -L/-R/-D ... [--name X]        Add tunnel
-  tunnel rm <name>                          Remove tunnel
-  tunnel reload                             Reload config
-  tunnel start-group <group>                Start all tunnels in group
-  tunnel stop-group <group>                 Stop all tunnels in group
-  tunnel init --systemd                     Generate systemd unit
+FORWARDING MODES (ad-hoc):
 
-Examples:
-  tunnel -L 3306:db.internal:3306
-  tunnel -L 443:web.internal:443 --tls --tls-cert cert.pem --tls-key key.pem
-  tunnel -R 9090:localhost:8080 -s server.example.com:9000
-  tunnel -D 1080
-  tunnel start --background
-  tunnel add -L 8080:web:80 --name web
-  tunnel init --systemd | sudo tee /etc/systemd/system/tunnel.service
+  tunnel -L [bind:]port:host:hostport
+        Local TCP forwarding, like ssh -L.
+        Forward a local port to a remote target.
+        Examples:
+          tunnel -L 3306:db.internal:3306         # mysql
+          tunnel -L 0.0.0.0:8080:web:80            # bind all interfaces
 
-Flags:
+  tunnel -D port
+        Dynamic SOCKS5 proxy, like ssh -D.
+        Start a SOCKS5 proxy on the given port.
+        Example:
+          tunnel -D 1080                           # curl --socks5 127.0.0.1:1080
+
+  tunnel -R port:host:hostport -s server:port
+        Remote TCP forwarding (NAT穿透), like ssh -R.
+        Expose a local port through a public server.
+        First start the server, then connect the client:
+          tunnel -s 0.0.0.0:9000                   # server (public machine)
+          tunnel -R 9090:localhost:8080 -s vps:9000  # client (NAT'd machine)
+
+TLS ENCRYPTION (all forwarding modes):
+
+  --tls                            Enable TLS 1.3 (auto-generates self-signed cert)
+  --tls-cert <file> --tls-key <file>  Use real PEM cert+key instead of auto-generating
+  --tls-verify                     Verify peer certificate (requires trusted CA)
+
+  Examples:
+    tunnel -L 8080:web:80 --tls                           # self-signed, skip verify
+    tunnel -L 443:web:443 --tls --tls-cert cert.pem --tls-key key.pem --tls-verify
+    tunnel -R 9090:localhost:8080 -s vps:9000 --tls --tls-verify
+
+AUTH TOKEN (remote forwarding):
+
+  --token <str>                    Require token for client connections
+    tunnel -s 0.0.0.0:9000 --token mytoken              # server
+    tunnel -R 9090:localhost:8080 -s vps:9000 --token mytoken  # client
+
+DAEMON MODE (managed tunnels via YAML config):
+
+  tunnel start [--background]      Start daemon
+  tunnel stop                      Stop daemon
+  tunnel ls                        List configured tunnels and their status
+  tunnel add -L/-R/-D ... [--name X]  Add and start a tunnel
+  tunnel rm <name>                 Remove a tunnel
+  tunnel reload                    Hot-reload ~/.config/tunnel/config.yaml
+  tunnel start-group <group>       Start all tunnels in a group
+  tunnel stop-group <group>        Stop all tunnels in a group
+
+  Config file: ~/.config/tunnel/config.yaml
+  Example:
+    tunnels:
+      - name: web
+        mode: local
+        local: 8080
+        remote: web.internal:80
+        autostart: true
+      - name: socks
+        mode: dynamic
+        local: 1080
+        autostart: true
+      - name: remote-web
+        mode: remote
+        server: vps.example.com:9000
+        remote: 9090:localhost:8080
+        token: mytoken
+        tls: true
+        tls_verify: true
+        autostart: true
+
+SYSTEMD INTEGRATION:
+
+  tunnel init --systemd            Print systemd unit (pipe to create service)
+    tunnel init --systemd | sudo tee /etc/systemd/system/tunnel.service
+    sudo systemctl enable --now tunnel
+
+  tunnel init                      Print installation hint
+
+OTHER FLAGS:
 `)
 		flag.PrintDefaults()
 	}
@@ -83,13 +140,13 @@ Flags:
 		flag.CommandLine.Parse(os.Args[1:])
 		switch {
 		case *localF != "":
-			runAdhocLocal(*localF, *tlsF, *tlsCertF, *tlsKeyF, *udpF)
+			runAdhocLocal(*localF, *tlsF, *tlsCertF, *tlsKeyF, *tlsVerifyF, *udpF)
 		case *dynamicF != "":
 			runAdhocDynamic(*dynamicF)
 		case *remoteF != "" && *serverF != "":
-			runAdhocRemote(*remoteF, *serverF, *tokenF, *tlsF, *tlsCertF, *tlsKeyF)
+			runAdhocRemote(*remoteF, *serverF, *tokenF, *tlsF, *tlsCertF, *tlsKeyF, *tlsVerifyF)
 		case *remoteF == "" && *serverF != "":
-			runAdhocRemoteServer(*serverF, *tokenF, *tlsF, *tlsCertF, *tlsKeyF)
+			runAdhocRemoteServer(*serverF, *tokenF, *tlsF, *tlsCertF, *tlsKeyF, *tlsVerifyF)
 		default:
 			flag.Usage()
 			os.Exit(1)
@@ -382,7 +439,7 @@ func parseRemoteSpec(spec string) (remotePort uint16, targetAddr string, err err
 	return uint16(p), targetAddr, nil
 }
 
-func runAdhocLocal(spec string, tls bool, tlsCert, tlsKey string, udp bool) {
+func runAdhocLocal(spec string, tls bool, tlsCert, tlsKey string, tlsVerify bool, udp bool) {
 	if udp {
 		log.Fatal("UDP forwarding not yet implemented")
 	}
@@ -393,7 +450,7 @@ func runAdhocLocal(spec string, tls bool, tlsCert, tlsKey string, udp bool) {
 	log.Printf("Listening on %s, forwarding to %s", listenAddr, dialAddr)
 	var proxy *relay.Proxy
 	if tls {
-		tlsCfg, err := relay.SetupTLS(tlsCert, tlsKey)
+		tlsCfg, err := relay.SetupTLS(tlsCert, tlsKey, tlsVerify)
 		if err != nil {
 			log.Fatalf("TLS setup: %v", err)
 		}
@@ -416,7 +473,7 @@ func runAdhocLocal(spec string, tls bool, tlsCert, tlsKey string, udp bool) {
 	}
 }
 
-func runAdhocRemote(remoteSpec, serverAddr, token string, tls bool, tlsCert, tlsKey string) {
+func runAdhocRemote(remoteSpec, serverAddr, token string, tls bool, tlsCert, tlsKey string, tlsVerify bool) {
 	remotePort, targetAddr, err := parseRemoteSpec(remoteSpec)
 	if err != nil {
 		log.Fatal(err)
@@ -424,7 +481,7 @@ func runAdhocRemote(remoteSpec, serverAddr, token string, tls bool, tlsCert, tls
 
 	var tlsCfg *relay.TLSConfig
 	if tls {
-		tlsCfg, err = relay.SetupTLS(tlsCert, tlsKey)
+		tlsCfg, err = relay.SetupTLS(tlsCert, tlsKey, tlsVerify)
 		if err != nil {
 			log.Fatalf("TLS setup: %v", err)
 		}
@@ -448,11 +505,11 @@ func runAdhocRemote(remoteSpec, serverAddr, token string, tls bool, tlsCert, tls
 	client.Run()
 }
 
-func runAdhocRemoteServer(serverAddr, token string, tls bool, tlsCert, tlsKey string) {
+func runAdhocRemoteServer(serverAddr, token string, tls bool, tlsCert, tlsKey string, tlsVerify bool) {
 	var tlsCfg *relay.TLSConfig
 	if tls {
 		var err error
-		tlsCfg, err = relay.SetupTLS(tlsCert, tlsKey)
+		tlsCfg, err = relay.SetupTLS(tlsCert, tlsKey, tlsVerify)
 		if err != nil {
 			log.Fatalf("TLS setup: %v", err)
 		}

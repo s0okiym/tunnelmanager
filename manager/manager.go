@@ -217,7 +217,7 @@ func (m *Manager) runLocal(tc TunnelConfig, stop <-chan struct{}) {
 	var err error
 
 	if tc.TLS {
-		tlsCfg, cErr := relay.SetupTLS(tc.TLSCert, tc.TLSKey)
+		tlsCfg, cErr := relay.SetupTLS(tc.TLSCert, tc.TLSKey, tc.TLSVerify)
 		if cErr != nil {
 			log.Printf("manager: %s: tls: %v", tc.Name, cErr)
 			return
@@ -288,7 +288,7 @@ func (m *Manager) runRemoteClient(tc TunnelConfig, stop <-chan struct{}) {
 	var tlsCfg *relay.TLSConfig
 	if tc.TLS {
 		var err error
-		tlsCfg, err = relay.SetupTLS(tc.TLSCert, tc.TLSKey)
+		tlsCfg, err = relay.SetupTLS(tc.TLSCert, tc.TLSKey, tc.TLSVerify)
 		if err != nil {
 			log.Printf("manager: %s: tls: %v", tc.Name, err)
 			return
@@ -314,7 +314,7 @@ func (m *Manager) runRemoteClientMulti(tc TunnelConfig, stop <-chan struct{}) {
 	var tlsCfg *relay.TLSConfig
 	if tc.TLS {
 		var err error
-		tlsCfg, err = relay.SetupTLS(tc.TLSCert, tc.TLSKey)
+		tlsCfg, err = relay.SetupTLS(tc.TLSCert, tc.TLSKey, tc.TLSVerify)
 		if err != nil {
 			log.Printf("manager: %s: tls: %v", tc.Name, err)
 			return
@@ -348,7 +348,7 @@ func (m *Manager) runRemoteServer(tc TunnelConfig, stop <-chan struct{}) {
 	var tlsCfg *relay.TLSConfig
 	if tc.TLS {
 		var err error
-		tlsCfg, err = relay.SetupTLS(tc.TLSCert, tc.TLSKey)
+		tlsCfg, err = relay.SetupTLS(tc.TLSCert, tc.TLSKey, tc.TLSVerify)
 		if err != nil {
 			log.Printf("manager: %s: tls: %v", tc.Name, err)
 			return

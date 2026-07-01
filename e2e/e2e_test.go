@@ -762,8 +762,8 @@ func TestE2ELocalProxyTLSCustomCert(t *testing.T) {
 		}
 	}()
 
-	// SetupTLS with custom cert -> Insecure=false (verify peer cert)
-	srvCfg, err := relay.SetupTLS("/tmp/test-srv.pem", "/tmp/test-srv-key.pem")
+	// SetupTLS with custom cert and verify=true -> Insecure=false
+	srvCfg, err := relay.SetupTLS("/tmp/test-srv.pem", "/tmp/test-srv-key.pem", true)
 	if err != nil {
 		t.Fatal(err)
 	}

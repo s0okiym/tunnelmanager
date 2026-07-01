@@ -32,6 +32,7 @@ type TunnelConfig struct {
 	TLS       bool     `yaml:"tls,omitempty"`       // TLS enabled
 	TLSCert   string   `yaml:"tls_cert,omitempty"`  // TLS cert file (PEM)
 	TLSKey    string   `yaml:"tls_key,omitempty"`   // TLS key file (PEM)
+	TLSVerify bool     `yaml:"tls_verify,omitempty"` // TLS peer certificate verification
 	Protocol  string   `yaml:"protocol,omitempty"`  // tcp (default) or udp
 	Autostart bool     `yaml:"autostart,omitempty"` // start on daemon launch
 	Group     string   `yaml:"group,omitempty"`     // connection group
