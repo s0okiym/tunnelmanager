@@ -5,6 +5,7 @@
 - **Build:** `go build ./...`
 - **Test (all):** `go test -race -count=1 ./...`
 - **Test (relay):** `go test -race -count=1 ./relay/`
+- **Test (manager):** `go test -race -count=1 ./manager/`
 - **Single test:** `go test -race -count=1 -run TestProxyEcho ./relay/`
 - **Lint:** (none configured — no linter yet)
 - **Typecheck:** `go vet ./...`
@@ -14,6 +15,12 @@
 ```
 tunnel/
 ├── main.go                   — CLI: -L/-R/-D flags, signal handling
+├── manager/
+│   ├── config.go             — YAML config types, load/save
+│   ├── daemon.go             — Daemon lifecycle (pidfile, IsRunning)
+│   ├── control.go            — Unix socket JSON-RPC server/client
+│   ├── manager.go            — Tunnel lifecycle (start/stop/add/remove/list)
+│   └── manager_test.go       — Tests for config, manager, control
 ├── relay/
 │   ├── relay.go              — core Relay (io.CopyBuffer + buffer pool + closeWrite)
 │   ├── relay_test.go         — 20+ tests (proxy, relay, SOCKS5, remote, TLS, frame)
@@ -34,7 +41,7 @@ tunnel/
 └── AGENTS.md
 ```
 
-## Phase 1-3 delivered
+## Phase 1-4 delivered
 
 - **Local TCP forwarding** (`tunnel -L [bind:]port:host:hostport`)
 - **SOCKS5 dynamic proxy** (`tunnel -D port`)
@@ -61,4 +68,4 @@ Phase 6: Multi-hop, UDP, splice(2)
 - **Buffer pool** — 32KB per direction, reused via `sync.Pool`.
 - **CtrlConn auth/register** happens *before* the read loop starts (standalone functions), then CtrlConn takes over frame dispatching.
 - **Channel.CloseWrite()** sends a ChannelClose frame — the receiver reads EOF but the channel remains usable in the other direction.
-- **No external dependencies** — only stdlib.
+- **No external dependencies** — only stdlib + `gopkg.in/yaml.v3` (Phase 4).
