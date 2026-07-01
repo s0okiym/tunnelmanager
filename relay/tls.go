@@ -17,10 +17,40 @@ type TLSConfig struct {
 	Enabled  bool
 	Cert     tls.Certificate
 	Insecure bool
+	CertFile string
+	KeyFile  string
 }
 
 func NewTLSConfig(insecure bool) *TLSConfig {
 	return &TLSConfig{Enabled: true, Insecure: insecure}
+}
+
+// SetupTLS returns a TLSConfig. If certFile and keyFile are non-empty, loads
+// them via tls.LoadX509KeyPair; otherwise generates an auto self-signed cert.
+func SetupTLS(certFile, keyFile string) (*TLSConfig, error) {
+	cfg := &TLSConfig{Enabled: true, Insecure: true}
+	if certFile != "" && keyFile != "" {
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load x509 key pair: %w", err)
+		}
+		cfg.Cert = cert
+	} else {
+		cert, err := GenerateCert()
+		if err != nil {
+			return nil, fmt.Errorf("generate cert: %w", err)
+		}
+		cfg.Cert = cert
+	}
+	return cfg, nil
+}
+
+// SetupTLSCert returns tls.Certificate from files or auto-generated as fallback.
+func SetupTLSCert(certFile, keyFile string) (tls.Certificate, error) {
+	if certFile != "" && keyFile != "" {
+		return tls.LoadX509KeyPair(certFile, keyFile)
+	}
+	return GenerateCert()
 }
 
 func GenerateCert() (tls.Certificate, error) {

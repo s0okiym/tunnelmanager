@@ -213,7 +213,20 @@ func (m *Manager) startOne(tc TunnelConfig) error {
 }
 
 func (m *Manager) runLocal(tc TunnelConfig, stop <-chan struct{}) {
-	proxy, err := relay.NewProxy(tc.Local, tc.Remote)
+	var proxy *relay.Proxy
+	var err error
+
+	if tc.TLS {
+		cert, cErr := relay.SetupTLSCert(tc.TLSCert, tc.TLSKey)
+		if cErr != nil {
+			log.Printf("manager: %s: tls cert: %v", tc.Name, cErr)
+			return
+		}
+		tlsCfg := &relay.TLSConfig{Enabled: true, Cert: cert, Insecure: true}
+		proxy, err = relay.NewTLSProxy(tc.Local, tc.Remote, tlsCfg)
+	} else {
+		proxy, err = relay.NewProxy(tc.Local, tc.Remote)
+	}
 	if err != nil {
 		log.Printf("manager: %s: proxy failed: %v", tc.Name, err)
 		return
@@ -275,7 +288,7 @@ func (m *Manager) runDynamic(tc TunnelConfig, stop <-chan struct{}) {
 func (m *Manager) runRemoteClient(tc TunnelConfig, stop <-chan struct{}) {
 	var tlsCfg *relay.TLSConfig
 	if tc.TLS {
-		cert, err := relay.GenerateCert()
+		cert, err := relay.SetupTLSCert(tc.TLSCert, tc.TLSKey)
 		if err != nil {
 			log.Printf("manager: %s: tls cert: %v", tc.Name, err)
 			return
@@ -301,7 +314,7 @@ func (m *Manager) runRemoteClient(tc TunnelConfig, stop <-chan struct{}) {
 func (m *Manager) runRemoteClientMulti(tc TunnelConfig, stop <-chan struct{}) {
 	var tlsCfg *relay.TLSConfig
 	if tc.TLS {
-		cert, err := relay.GenerateCert()
+		cert, err := relay.SetupTLSCert(tc.TLSCert, tc.TLSKey)
 		if err != nil {
 			log.Printf("manager: %s: tls cert: %v", tc.Name, err)
 			return
@@ -335,7 +348,7 @@ func (m *Manager) runRemoteClientMulti(tc TunnelConfig, stop <-chan struct{}) {
 func (m *Manager) runRemoteServer(tc TunnelConfig, stop <-chan struct{}) {
 	var tlsCfg *relay.TLSConfig
 	if tc.TLS {
-		cert, err := relay.GenerateCert()
+		cert, err := relay.SetupTLSCert(tc.TLSCert, tc.TLSKey)
 		if err != nil {
 			log.Printf("manager: %s: tls cert: %v", tc.Name, err)
 			return

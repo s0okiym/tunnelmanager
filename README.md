@@ -210,15 +210,22 @@ ssh -o ProxyCommand='nc -x 127.0.0.1:1080 %h %p' user@target
 
 ## 场景四：启用 TLS 加密
 
-所有模式均可通过 `--tls` 标志启用 TLS 1.3 加密。TLS 证书在启动时自动生成（ECDSA P-256，自签名）。
+所有模式均可通过 `--tls` 标志启用 TLS 1.3 加密。默认自动生成自签名证书，也可指定真实证书文件。
 
-### 本地转发 + TLS
+### 使用自动生成的自签名证书
 
 ```bash
+# 本地转发
 tunnel -L 8080:web.internal:80 --tls
+
+# 远程转发服务端
+tunnel -s 0.0.0.0:9000 --tls
+
+# 远程转发客户端
+tunnel -R 9090:localhost:8080 -s server.example.com:9000 --tls --token mytoken
 ```
 
-工作流程：
+工作流程（以本地转发为例）：
 
 ```
 [客户端] --TLS 1.3 加密--> [tunnel -L --tls :8080] --明文 TCP--> [web.internal:80]
@@ -242,25 +249,41 @@ tunnel -L 9998:127.0.0.1:9999 --tls
 echo "hello" | openssl s_client -connect 127.0.0.1:9998 -quiet
 ```
 
-### 远程转发 + TLS
+### 指定真实证书
 
-服务端：
+使用 `--tls-cert` 和 `--tls-key` 指定 PEM 格式的证书和私钥文件（支持所有模式）：
 
 ```bash
-tunnel -s 0.0.0.0:9000 --tls
+# 本地转发
+tunnel -L 443:web.internal:443 --tls --tls-cert /etc/letsencrypt/live/example.com/fullchain.pem --tls-key /etc/letsencrypt/live/example.com/privkey.pem
+
+# 远程转发服务端
+tunnel -s 0.0.0.0:9000 --tls --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
+
+# 远程转发客户端
+tunnel -R 9090:localhost:8080 -s server.example.com:9000 --tls --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
 ```
 
-客户端：
+也可以通过 YAML 配置文件指定：
 
-```bash
-tunnel -R 9090:localhost:8080 -s server.example.com:9000 --tls --token mytoken
+```yaml
+tunnels:
+  - name: secured-proxy
+    mode: local
+    local: 443
+    remote: web.internal:443
+    tls: true
+    tls_cert: /etc/letsencrypt/live/example.com/fullchain.pem
+    tls_key: /etc/letsencrypt/live/example.com/privkey.pem
+    autostart: true
 ```
 
 ### TLS 配置说明
 
 - 使用 TLS 1.3（最高安全版本，仅一个加密套件，完美前向安全性）
-- 证书自签名（ECDSA P-256），每次启动自动生成，有效期 1 年
+- 默认自动生成 ECDSA P-256 自签名证书，有效期 1 年
 - 客户端默认 `InsecureSkipVerify = true`（自签名证书跳过验证）
+- 指定 `--tls-cert` / `--tls-key` 时使用真实证书，客户端无需 `InsecureSkipVerify`
 - 本地转发（`-L --tls`）和远程转发（`-R --tls` + `-s --tls`）均支持
 - 加密段仅在"客户端 ↔ tunnel"之间，tunnel → 目标为明文 TCP
 

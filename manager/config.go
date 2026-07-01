@@ -30,6 +30,8 @@ type TunnelConfig struct {
 	Server    string   `yaml:"server,omitempty"`    // server addr (remote client mode)
 	Token     string   `yaml:"token,omitempty"`     // auth token
 	TLS       bool     `yaml:"tls,omitempty"`       // TLS enabled
+	TLSCert   string   `yaml:"tls_cert,omitempty"`  // TLS cert file (PEM)
+	TLSKey    string   `yaml:"tls_key,omitempty"`   // TLS key file (PEM)
 	Protocol  string   `yaml:"protocol,omitempty"`  // tcp (default) or udp
 	Autostart bool     `yaml:"autostart,omitempty"` // start on daemon launch
 	Group     string   `yaml:"group,omitempty"`     // connection group

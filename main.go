@@ -20,6 +20,8 @@ func main() {
 	serverF := flag.String("s", "", "Server address for remote forwarding")
 	tokenF := flag.String("token", "", "Auth token for remote forwarding")
 	tlsF := flag.Bool("tls", false, "Enable TLS encryption")
+	tlsCertF := flag.String("tls-cert", "", "TLS certificate file (PEM)")
+	tlsKeyF := flag.String("tls-key", "", "TLS key file (PEM)")
 	udpF := flag.Bool("udp", false, "Use UDP instead of TCP")
 
 	flag.Usage = func() {
@@ -41,6 +43,7 @@ Usage:
 
 Examples:
   tunnel -L 3306:db.internal:3306
+  tunnel -L 443:web.internal:443 --tls --tls-cert cert.pem --tls-key key.pem
   tunnel -R 9090:localhost:8080 -s server.example.com:9000
   tunnel -D 1080
   tunnel start --background
@@ -80,13 +83,13 @@ Flags:
 		flag.CommandLine.Parse(os.Args[1:])
 		switch {
 		case *localF != "":
-			runAdhocLocal(*localF, *tlsF, *udpF)
+			runAdhocLocal(*localF, *tlsF, *tlsCertF, *tlsKeyF, *udpF)
 		case *dynamicF != "":
 			runAdhocDynamic(*dynamicF)
 		case *remoteF != "" && *serverF != "":
-			runAdhocRemote(*remoteF, *serverF, *tokenF, *tlsF)
+			runAdhocRemote(*remoteF, *serverF, *tokenF, *tlsF, *tlsCertF, *tlsKeyF)
 		case *remoteF == "" && *serverF != "":
-			runAdhocRemoteServer(*serverF, *tokenF, *tlsF)
+			runAdhocRemoteServer(*serverF, *tokenF, *tlsF, *tlsCertF, *tlsKeyF)
 		default:
 			flag.Usage()
 			os.Exit(1)
@@ -379,7 +382,7 @@ func parseRemoteSpec(spec string) (remotePort uint16, targetAddr string, err err
 	return uint16(p), targetAddr, nil
 }
 
-func runAdhocLocal(spec string, tls bool, udp bool) {
+func runAdhocLocal(spec string, tls bool, tlsCert, tlsKey string, udp bool) {
 	if udp {
 		log.Fatal("UDP forwarding not yet implemented")
 	}
@@ -390,11 +393,10 @@ func runAdhocLocal(spec string, tls bool, udp bool) {
 	log.Printf("Listening on %s, forwarding to %s", listenAddr, dialAddr)
 	var proxy *relay.Proxy
 	if tls {
-		cert, err := relay.GenerateCert()
+		tlsCfg, err := relay.SetupTLS(tlsCert, tlsKey)
 		if err != nil {
-			log.Fatalf("Failed to generate TLS cert: %v", err)
+			log.Fatalf("TLS setup: %v", err)
 		}
-		tlsCfg := &relay.TLSConfig{Enabled: true, Cert: cert, Insecure: true}
 		proxy, err = relay.NewTLSProxy(listenAddr, dialAddr, tlsCfg)
 	} else {
 		proxy, err = relay.NewProxy(listenAddr, dialAddr)
@@ -414,7 +416,7 @@ func runAdhocLocal(spec string, tls bool, udp bool) {
 	}
 }
 
-func runAdhocRemote(remoteSpec, serverAddr, token string, tls bool) {
+func runAdhocRemote(remoteSpec, serverAddr, token string, tls bool, tlsCert, tlsKey string) {
 	remotePort, targetAddr, err := parseRemoteSpec(remoteSpec)
 	if err != nil {
 		log.Fatal(err)
@@ -422,11 +424,10 @@ func runAdhocRemote(remoteSpec, serverAddr, token string, tls bool) {
 
 	var tlsCfg *relay.TLSConfig
 	if tls {
-		cert, err := relay.GenerateCert()
+		tlsCfg, err = relay.SetupTLS(tlsCert, tlsKey)
 		if err != nil {
-			log.Fatalf("Failed to generate TLS cert: %v", err)
+			log.Fatalf("TLS setup: %v", err)
 		}
-		tlsCfg = &relay.TLSConfig{Enabled: true, Cert: cert, Insecure: true}
 	}
 
 	tunnels := []relay.RemoteTunnel{
@@ -447,14 +448,14 @@ func runAdhocRemote(remoteSpec, serverAddr, token string, tls bool) {
 	client.Run()
 }
 
-func runAdhocRemoteServer(serverAddr, token string, tls bool) {
+func runAdhocRemoteServer(serverAddr, token string, tls bool, tlsCert, tlsKey string) {
 	var tlsCfg *relay.TLSConfig
 	if tls {
-		cert, err := relay.GenerateCert()
+		var err error
+		tlsCfg, err = relay.SetupTLS(tlsCert, tlsKey)
 		if err != nil {
-			log.Fatalf("Failed to generate TLS cert: %v", err)
+			log.Fatalf("TLS setup: %v", err)
 		}
-		tlsCfg = &relay.TLSConfig{Enabled: true, Cert: cert, Insecure: true}
 	}
 
 	srv, err := relay.NewRemoteServer(serverAddr, token, tlsCfg)
