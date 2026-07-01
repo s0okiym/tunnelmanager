@@ -217,12 +217,11 @@ func (m *Manager) runLocal(tc TunnelConfig, stop <-chan struct{}) {
 	var err error
 
 	if tc.TLS {
-		cert, cErr := relay.SetupTLSCert(tc.TLSCert, tc.TLSKey)
+		tlsCfg, cErr := relay.SetupTLS(tc.TLSCert, tc.TLSKey)
 		if cErr != nil {
-			log.Printf("manager: %s: tls cert: %v", tc.Name, cErr)
+			log.Printf("manager: %s: tls: %v", tc.Name, cErr)
 			return
 		}
-		tlsCfg := &relay.TLSConfig{Enabled: true, Cert: cert, Insecure: true}
 		proxy, err = relay.NewTLSProxy(tc.Local, tc.Remote, tlsCfg)
 	} else {
 		proxy, err = relay.NewProxy(tc.Local, tc.Remote)
@@ -288,12 +287,12 @@ func (m *Manager) runDynamic(tc TunnelConfig, stop <-chan struct{}) {
 func (m *Manager) runRemoteClient(tc TunnelConfig, stop <-chan struct{}) {
 	var tlsCfg *relay.TLSConfig
 	if tc.TLS {
-		cert, err := relay.SetupTLSCert(tc.TLSCert, tc.TLSKey)
+		var err error
+		tlsCfg, err = relay.SetupTLS(tc.TLSCert, tc.TLSKey)
 		if err != nil {
-			log.Printf("manager: %s: tls cert: %v", tc.Name, err)
+			log.Printf("manager: %s: tls: %v", tc.Name, err)
 			return
 		}
-		tlsCfg = &relay.TLSConfig{Enabled: true, Cert: cert, Insecure: true}
 	}
 
 	port, target := parseRemoteSpec(tc.Remote)
@@ -314,12 +313,12 @@ func (m *Manager) runRemoteClient(tc TunnelConfig, stop <-chan struct{}) {
 func (m *Manager) runRemoteClientMulti(tc TunnelConfig, stop <-chan struct{}) {
 	var tlsCfg *relay.TLSConfig
 	if tc.TLS {
-		cert, err := relay.SetupTLSCert(tc.TLSCert, tc.TLSKey)
+		var err error
+		tlsCfg, err = relay.SetupTLS(tc.TLSCert, tc.TLSKey)
 		if err != nil {
-			log.Printf("manager: %s: tls cert: %v", tc.Name, err)
+			log.Printf("manager: %s: tls: %v", tc.Name, err)
 			return
 		}
-		tlsCfg = &relay.TLSConfig{Enabled: true, Cert: cert, Insecure: true}
 	}
 
 	port, target := parseRemoteSpec(tc.Remote)
@@ -348,12 +347,12 @@ func (m *Manager) runRemoteClientMulti(tc TunnelConfig, stop <-chan struct{}) {
 func (m *Manager) runRemoteServer(tc TunnelConfig, stop <-chan struct{}) {
 	var tlsCfg *relay.TLSConfig
 	if tc.TLS {
-		cert, err := relay.SetupTLSCert(tc.TLSCert, tc.TLSKey)
+		var err error
+		tlsCfg, err = relay.SetupTLS(tc.TLSCert, tc.TLSKey)
 		if err != nil {
-			log.Printf("manager: %s: tls cert: %v", tc.Name, err)
+			log.Printf("manager: %s: tls: %v", tc.Name, err)
 			return
 		}
-		tlsCfg = &relay.TLSConfig{Enabled: true, Cert: cert, Insecure: true}
 	}
 
 	srv, err := relay.NewRemoteServer(tc.Local, tc.Token, tlsCfg)

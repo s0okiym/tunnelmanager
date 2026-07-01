@@ -3,9 +3,12 @@ package e2e
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -759,20 +762,33 @@ func TestE2ELocalProxyTLSCustomCert(t *testing.T) {
 		}
 	}()
 
-	// Use SetupTLS with custom cert/key files
-	tlsCfg, err := relay.SetupTLS("/tmp/test-cert.pem", "/tmp/test-key.pem")
+	// SetupTLS with custom cert -> Insecure=false (verify peer cert)
+	srvCfg, err := relay.SetupTLS("/tmp/test-srv.pem", "/tmp/test-srv-key.pem")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	proxy, err := relay.NewTLSProxy("127.0.0.1:0", echoLn.Addr().String(), tlsCfg)
+	proxy, err := relay.NewTLSProxy("127.0.0.1:0", echoLn.Addr().String(), srvCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	go proxy.Serve()
 	defer proxy.Close()
 
-	conn, err := relay.TLSDial(proxy.Addr().String(), tlsCfg)
+	// Dial with the CA cert in the root pool — verification must pass
+	caCert, err := os.ReadFile("/tmp/test-ca.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caCert) {
+		t.Fatal("failed to append CA cert")
+	}
+	tlsDialCfg := &tls.Config{
+		RootCAs:    caPool,
+		MinVersion: tls.VersionTLS13,
+	}
+	conn, err := tls.Dial("tcp", proxy.Addr().String(), tlsDialCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
