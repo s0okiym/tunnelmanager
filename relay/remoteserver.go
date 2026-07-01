@@ -40,6 +40,10 @@ func NewRemoteServer(listenAddr, token string, tlsCfg *TLSConfig) (*RemoteServer
 	}, nil
 }
 
+func (rs *RemoteServer) Addr() net.Addr {
+	return rs.ctrlLn.Addr()
+}
+
 func (rs *RemoteServer) Serve() error {
 	for {
 		conn, err := rs.ctrlLn.Accept()

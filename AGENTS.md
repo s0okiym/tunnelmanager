@@ -41,7 +41,7 @@ tunnel/
 └── AGENTS.md
 ```
 
-## Phase 1-6 delivered
+## Phase 1-6 delivered (all E2E regression tests passing)
 
 - **Local TCP forwarding** (`tunnel -L [bind:]port:host:hostport`)
 - **SOCKS5 dynamic proxy** (`tunnel -D port`)
