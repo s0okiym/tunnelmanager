@@ -99,7 +99,7 @@ func (rc *RemoteClient) connect() error {
 	}()
 
 	stopHeartbeat := make(chan struct{})
-	go KeepAlive(cc, 15*time.Second, stopHeartbeat)
+	go KeepAlive(cc, 15*time.Second, 45*time.Second, stopHeartbeat)
 	defer close(stopHeartbeat)
 
 	log.Printf("remote: connected to %s, %d tunnels registered", rc.serverAddr, len(rc.tunnels))

@@ -7,7 +7,10 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"tunnel/manager"
 	"tunnel/relay"
@@ -117,6 +120,8 @@ OTHER FLAGS:
 		os.Exit(1)
 	}
 
+	applyGlobalConfig()
+
 	switch os.Args[1] {
 	case "start":
 		cmdStart()
@@ -219,52 +224,92 @@ func cmdList() {
 }
 
 func cmdAdd() {
-	// parse remaining args like -L, -R, -D
 	subArgs := os.Args[2:]
 	subFlags := flag.NewFlagSet("add", flag.ExitOnError)
 	l := subFlags.String("L", "", "Local forwarding")
 	r := subFlags.String("R", "", "Remote forwarding")
 	d := subFlags.String("D", "", "Dynamic SOCKS5")
 	name := subFlags.String("name", "", "Tunnel name")
+	server := subFlags.String("s", "", "Server address (for -R)")
+	token := subFlags.String("token", "", "Auth token (for -R)")
+	tlsF := subFlags.Bool("tls", false, "Enable TLS (for -R)")
+	tlsVerify := subFlags.Bool("tls-verify", false, "Verify TLS peer (for -R)")
+	tlsCert := subFlags.String("tls-cert", "", "TLS cert file (for -R)")
+	tlsKey := subFlags.String("tls-key", "", "TLS key file (for -R)")
 	subFlags.Parse(subArgs)
 
-	var tc manager.TunnelConfig
-
-	switch {
-	case *l != "":
-		tc.Mode = "local"
-		listen, target, err := parseLocalSpec(*l)
-		if err != nil {
-			log.Fatal(err)
-		}
-		tc.Local = listen
-		tc.Remote = target
-	case *r != "":
-		tc.Mode = "remote"
-		tc.Remote = *r
-		// Check if -s was passed (should be in remaining args, but it might not be)
-		// For simplicity, require server to be part of the spec
-	default:
-		log.Fatal("specify -L, -R, or -D")
-	}
-
-	if *name != "" {
-		tc.Name = *name
-	} else if *l != "" {
-		tc.Name = fmt.Sprintf("local-%s", *l)
-	} else if *r != "" {
-		tc.Name = fmt.Sprintf("remote-%s", *r)
-	} else if *d != "" {
-		tc.Name = fmt.Sprintf("dynamic-%s", *d)
-	}
-
-	tc.Autostart = true
-
-	_, err := manager.SendControl("add", tc)
+	tc, err := buildTunnelConfig(addParams{
+		local: *l, remote: *r, dynamic: *d, name: *name,
+		server: *server, token: *token,
+		tls: *tlsF, tlsVerify: *tlsVerify, tlsCert: *tlsCert, tlsKey: *tlsKey,
+	})
 	if err != nil {
+		log.Fatal(err)
+	}
+
+	if _, err := manager.SendControl("add", tc); err != nil {
 		log.Fatalf("add: %v", err)
 	}
 	fmt.Printf("Tunnel %q added and started.\n", tc.Name)
+}
+
+type addParams struct {
+	local, remote, dynamic, name string
+	server, token                string
+	tls, tlsVerify               bool
+	tlsCert, tlsKey              string
+}
+
+// buildTunnelConfig turns `tunnel add` flags into a TunnelConfig. It supports
+// all three modes (-L/-R/-D) and requires -s for remote tunnels.
+func buildTunnelConfig(p addParams) (manager.TunnelConfig, error) {
+	var tc manager.TunnelConfig
+	switch {
+	case p.local != "":
+		tc.Mode = "local"
+		listen, target, err := parseLocalSpec(p.local)
+		if err != nil {
+			return tc, err
+		}
+		tc.Local = listen
+		tc.Remote = target
+		tc.Name = defaultName(p.name, "local-"+p.local)
+	case p.remote != "":
+		if p.server == "" {
+			return tc, fmt.Errorf("-R requires -s server:port")
+		}
+		tc.Mode = "remote"
+		tc.Remote = p.remote
+		tc.Server = p.server
+		tc.Token = p.token
+		tc.TLS = p.tls
+		tc.TLSVerify = p.tlsVerify
+		tc.TLSCert = p.tlsCert
+		tc.TLSKey = p.tlsKey
+		tc.Name = defaultName(p.name, "remote-"+p.remote)
+	case p.dynamic != "":
+		tc.Mode = "dynamic"
+		tc.Local = normalizeListenAddr(p.dynamic)
+		tc.Name = defaultName(p.name, "dynamic-"+p.dynamic)
+	default:
+		return tc, fmt.Errorf("specify -L, -R, or -D")
+	}
+	tc.Autostart = true
+	return tc, nil
+}
+
+func defaultName(name, fallback string) string {
+	if name != "" {
+		return name
+	}
+	return fallback
+}
+
+func normalizeListenAddr(spec string) string {
+	if strings.Contains(spec, ":") {
+		return spec
+	}
+	return "127.0.0.1:" + spec
 }
 
 func cmdRemove() {
@@ -291,7 +336,9 @@ func cmdInit() {
 	case *systemd:
 		fmt.Print(manager.GenerateSystemdUnit())
 	case *systemdUser:
-		manager.WriteSystemdUnitUser("")
+		if err := manager.WriteSystemdUnitUser(""); err != nil {
+			log.Fatalf("write user unit: %v", err)
+		}
 		fmt.Println("Wrote tunnel.service to ~/.config/systemd/user/")
 	default:
 		fmt.Println(manager.SystemdInstallHint())
@@ -333,6 +380,14 @@ func cmdStopGroup() {
 // ─── Daemon runner ───────────────────────────────────────────────────
 
 func runDaemon(cfg *manager.Config) {
+	if cfg.Global.LogFile != "" {
+		if f, err := manager.SetupLogFile(cfg.Global.LogFile); err != nil {
+			log.Printf("log file: %v", err)
+		} else {
+			defer f.Close()
+		}
+	}
+
 	if err := manager.WritePidfile(); err != nil {
 		log.Fatalf("pidfile: %v", err)
 	}
@@ -343,31 +398,62 @@ func runDaemon(cfg *manager.Config) {
 		log.Fatalf("manager start: %v", err)
 	}
 
+	shutdown := make(chan struct{})
+	var shutdownOnce sync.Once
+	triggerShutdown := func() { shutdownOnce.Do(func() { close(shutdown) }) }
+
+	// Control server. A "stop" request stops the tunnels (in HandleControl) and
+	// then shuts the daemon down. The shutdown is deferred briefly so the
+	// response is flushed to the client before the process exits.
+	handler := func(req manager.Request) manager.Response {
+		resp := mgr.HandleControl(req)
+		if req.Method == "stop" {
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				triggerShutdown()
+			}()
+		}
+		return resp
+	}
+	go func() {
+		if err := manager.ServeControl(handler, shutdown); err != nil {
+			log.Printf("control server: %v", err)
+			triggerShutdown()
+		}
+	}()
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-
 	go func() {
 		for sig := range sigCh {
 			switch sig {
 			case syscall.SIGHUP:
 				log.Print("reloading config...")
-				newCfg, err := manager.LoadConfig("")
-				if err != nil {
+				if err := mgr.Reload(); err != nil {
 					log.Printf("reload: %v", err)
-					continue
 				}
-				mgr.Stop()
-				mgr = manager.NewManager(newCfg, "")
-				mgr.Start()
 			case syscall.SIGINT, syscall.SIGTERM:
-				log.Print("shutting down...")
-				mgr.Stop()
-				os.Exit(0)
+				triggerShutdown()
 			}
 		}
 	}()
 
-	log.Fatal(manager.ServeControl(mgr.HandleControl))
+	<-shutdown
+	log.Print("shutting down...")
+	mgr.Stop()
+}
+
+// applyGlobalConfig loads the config (best-effort) and applies process-wide
+// settings that the daemon and CLI clients must agree on — currently a custom
+// control socket path. Errors are ignored so commands still work with defaults.
+func applyGlobalConfig() {
+	cfg, err := manager.LoadConfig("")
+	if err != nil {
+		return
+	}
+	if cfg.Global.ControlSocket != "" {
+		manager.SetControlSocketPath(cfg.Global.ControlSocket)
+	}
 }
 
 // ─── Ad-hoc mode helpers ─────────────────────────────────────────────

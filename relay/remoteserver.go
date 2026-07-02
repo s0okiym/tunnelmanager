@@ -5,15 +5,18 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 type RemoteServer struct {
-	ctrlLn  net.Listener
-	token   string
-	tlsCfg  *TLSConfig
-	mu      sync.Mutex
-	wg      sync.WaitGroup
-	done    chan struct{}
+	ctrlLn net.Listener
+	token  string
+	tlsCfg *TLSConfig
+	mu     sync.Mutex
+	conns  map[*CtrlConn]struct{}
+	closed bool
+	wg     sync.WaitGroup
+	done   chan struct{}
 }
 
 func NewRemoteServer(listenAddr, token string, tlsCfg *TLSConfig) (*RemoteServer, error) {
@@ -36,6 +39,7 @@ func NewRemoteServer(listenAddr, token string, tlsCfg *TLSConfig) (*RemoteServer
 		ctrlLn: ln,
 		token:  token,
 		tlsCfg: tlsCfg,
+		conns:  make(map[*CtrlConn]struct{}),
 		done:   make(chan struct{}),
 	}, nil
 }
@@ -80,39 +84,67 @@ func (rs *RemoteServer) handleClient(conn net.Conn) {
 	}
 
 	cc := NewCtrlConn(conn)
-	if err != nil {
-		log.Printf("remote: register failed: %v", err)
-		return
+	defer cc.Close()
+
+	// Register the control connection so Close() can tear it down.
+	if !rs.trackConn(cc) {
+		return // server already closing
 	}
+	defer rs.untrackConn(cc)
 
 	for _, t := range tunnels {
-		rs.mu.Lock()
 		rs.wg.Add(1)
-		rs.mu.Unlock()
-
 		go rs.serveRemoteTunnel(cc, t.RemotePort, t.TargetAddr)
 	}
 
 	<-cc.Done()
 }
 
+func (rs *RemoteServer) trackConn(cc *CtrlConn) bool {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.closed {
+		return false
+	}
+	rs.conns[cc] = struct{}{}
+	return true
+}
+
+func (rs *RemoteServer) untrackConn(cc *CtrlConn) {
+	rs.mu.Lock()
+	delete(rs.conns, cc)
+	rs.mu.Unlock()
+}
+
 func (rs *RemoteServer) serveRemoteTunnel(cc *CtrlConn, remotePort uint16, targetAddr string) {
 	defer rs.wg.Done()
 
 	listenAddr := fmt.Sprintf("0.0.0.0:%d", remotePort)
-	ln, err := net.Listen("tcp", listenAddr)
+	ln, err := listenTunnel(listenAddr, cc)
 	if err != nil {
 		log.Printf("remote: cannot listen on %s: %v", listenAddr, err)
 		return
 	}
 	defer ln.Close()
 
+	// Release the listener as soon as the control connection dies, so the port
+	// is freed for the next (re)connection and the Accept below unblocks.
+	go func() {
+		<-cc.Done()
+		ln.Close()
+	}()
+
 	log.Printf("remote: listening on %s -> target %s", listenAddr, targetAddr)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("remote: accept on %s: %v", listenAddr, err)
+			select {
+			case <-cc.Done():
+				// listener was closed on control-connection teardown
+			default:
+				log.Printf("remote: accept on %s: %v", listenAddr, err)
+			}
 			return
 		}
 
@@ -131,9 +163,46 @@ func (rs *RemoteServer) serveRemoteTunnel(cc *CtrlConn, remotePort uint16, targe
 	}
 }
 
+// listenTunnel binds addr, retrying briefly if the port is still held by a
+// just-torn-down connection (the reconnect handoff race). It aborts early if
+// the control connection dies while waiting.
+func listenTunnel(addr string, cc *CtrlConn) (net.Listener, error) {
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			return ln, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, err
+		}
+		select {
+		case <-cc.Done():
+			return nil, err
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 func (rs *RemoteServer) Close() error {
+	rs.mu.Lock()
+	if rs.closed {
+		rs.mu.Unlock()
+		return nil
+	}
+	rs.closed = true
+	conns := make([]*CtrlConn, 0, len(rs.conns))
+	for cc := range rs.conns {
+		conns = append(conns, cc)
+	}
+	rs.mu.Unlock()
+
 	close(rs.done)
-	return rs.ctrlLn.Close()
+	err := rs.ctrlLn.Close()
+	for _, cc := range conns {
+		cc.Close()
+	}
+	return err
 }
 
 func (rs *RemoteServer) Wait() {

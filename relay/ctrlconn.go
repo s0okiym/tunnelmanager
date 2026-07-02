@@ -4,23 +4,26 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // CtrlConn manages a multiplexed control connection. It owns the read loop,
 // dispatches frames to channels, and serializes writes.
 type CtrlConn struct {
-	conn     net.Conn
-	wmu      sync.Mutex
-	channels map[uint32]*channel
-	cmu      sync.Mutex
-	nextID   uint32
-	newCh    chan *channel
-	readErr  error
-	done     chan struct{}
-	closeOnce sync.Once
+	conn         net.Conn
+	wmu          sync.Mutex
+	channels     map[uint32]*channel
+	cmu          sync.Mutex
+	nextID       uint32
+	newCh        chan *channel
+	readErr      error
+	done         chan struct{}
+	closeOnce    sync.Once
+	lastActivity atomic.Int64 // unix nanos of the most recent inbound frame
 }
 
 func NewCtrlConn(conn net.Conn) *CtrlConn {
@@ -31,6 +34,7 @@ func NewCtrlConn(conn net.Conn) *CtrlConn {
 		newCh:    make(chan *channel, 64),
 		done:     make(chan struct{}),
 	}
+	cc.lastActivity.Store(time.Now().UnixNano())
 	go cc.readLoop()
 	return cc
 }
@@ -46,8 +50,14 @@ func (cc *CtrlConn) readLoop() {
 			cc.closeAll()
 			return
 		}
+		cc.lastActivity.Store(time.Now().UnixNano())
 		cc.handleFrame(frame)
 	}
+}
+
+// LastActivity reports when the last frame was received from the peer.
+func (cc *CtrlConn) LastActivity() time.Time {
+	return time.Unix(0, cc.lastActivity.Load())
 }
 
 func (cc *CtrlConn) handleFrame(f Frame) {
@@ -117,6 +127,13 @@ func (cc *CtrlConn) handleChannelClose(payload []byte) {
 	if ok {
 		ch.setError(io.EOF)
 	}
+}
+
+// removeChannel drops a fully-closed channel from the multiplexer map.
+func (cc *CtrlConn) removeChannel(id uint32) {
+	cc.cmu.Lock()
+	delete(cc.channels, id)
+	cc.cmu.Unlock()
 }
 
 func (cc *CtrlConn) handlePing(payload []byte) {
@@ -242,13 +259,20 @@ func boolToByte(b bool) byte {
 	return 0
 }
 
-// KeepAlive sends periodic pings to the remote end.
-func KeepAlive(cc *CtrlConn, interval time.Duration, stop <-chan struct{}) {
+// KeepAlive sends periodic pings to the remote end. If timeout > 0 and no frame
+// has been received from the peer within that window, the connection is
+// considered dead and closed so the caller can reconnect.
+func KeepAlive(cc *CtrlConn, interval, timeout time.Duration, stop <-chan struct{}) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
+			if timeout > 0 && time.Since(cc.LastActivity()) > timeout {
+				log.Printf("remote: no response from peer for %v; closing dead connection", timeout)
+				cc.Close()
+				return
+			}
 			var ts [8]byte
 			binary.BigEndian.PutUint64(ts[:], uint64(time.Now().UnixNano()))
 			cc.sendFrame(FramePing, ts[:])

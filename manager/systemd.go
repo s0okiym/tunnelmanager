@@ -47,8 +47,14 @@ func WriteSystemdUnit(path string) error {
 
 func WriteSystemdUnitUser(path string) error {
 	if path == "" {
-		home, _ := os.UserHomeDir()
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("resolve home dir: %w", err)
+		}
 		path = filepath.Join(home, ".config", "systemd", "user", "tunnel.service")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("create systemd user dir: %w", err)
 	}
 	return WriteSystemdUnit(path)
 }

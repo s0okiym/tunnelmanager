@@ -819,5 +819,3 @@ func findFreePort(t *testing.T) uint16 {
 	ln.Close()
 	return port
 }
-
-

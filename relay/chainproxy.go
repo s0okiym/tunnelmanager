@@ -27,6 +27,10 @@ func NewChainProxy(listenAddr string, hops []string) (*ChainProxy, error) {
 	}, nil
 }
 
+func (cp *ChainProxy) Addr() net.Addr {
+	return cp.listener.Addr()
+}
+
 func (cp *ChainProxy) Serve() error {
 	for {
 		conn, err := cp.listener.Accept()

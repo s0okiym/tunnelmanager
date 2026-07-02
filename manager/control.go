@@ -6,7 +6,18 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
+	"time"
 )
+
+// controlReadTimeout bounds how long a control connection may take to send its
+// request before the server gives up on it (prevents idle-connection goroutine
+// leaks). Stored as nanoseconds so it can be adjusted safely from tests.
+var controlReadTimeout atomic.Int64
+
+func init() {
+	controlReadTimeout.Store(int64(10 * time.Second))
+}
 
 type Request struct {
 	Method string          `json:"method"`
@@ -30,11 +41,27 @@ type TunnelStatus struct {
 	Error  string `json:"error,omitempty"`
 }
 
+// controlSocketOverride, when non-empty, replaces the default control socket
+// path. It is set once at process startup (before the server starts) so it does
+// not need synchronization.
+var controlSocketOverride string
+
+// SetControlSocketPath overrides the control socket path (e.g. from config).
+// Pass "" to clear the override and fall back to the default.
+func SetControlSocketPath(p string) {
+	controlSocketOverride = p
+}
+
 func ControlSocketPath() string {
+	if controlSocketOverride != "" {
+		return controlSocketOverride
+	}
 	return filepath.Join(DefaultDataDir, "control.sock")
 }
 
-func ServeControl(handler func(Request) Response) error {
+// ServeControl serves the control socket until stop is closed (or a fatal error
+// occurs). Passing a nil stop channel runs until the listener errors.
+func ServeControl(handler func(Request) Response, stop <-chan struct{}) error {
 	path := ControlSocketPath()
 	os.Remove(path)
 	os.MkdirAll(filepath.Dir(path), 0755)
@@ -44,9 +71,31 @@ func ServeControl(handler func(Request) Response) error {
 		return fmt.Errorf("control listen: %w", err)
 	}
 
+	// Restrict the control socket to its owner — anyone able to reach it can
+	// add/remove/stop tunnels, and the protocol itself is unauthenticated.
+	if err := os.Chmod(path, 0600); err != nil {
+		ln.Close()
+		return fmt.Errorf("control socket chmod: %w", err)
+	}
+	defer os.Remove(path)
+
+	if stop != nil {
+		go func() {
+			<-stop
+			ln.Close()
+		}()
+	}
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if stop != nil {
+				select {
+				case <-stop:
+					return nil
+				default:
+				}
+			}
 			return err
 		}
 		go handleControlConn(conn, handler)
@@ -55,6 +104,10 @@ func ServeControl(handler func(Request) Response) error {
 
 func handleControlConn(conn net.Conn, handler func(Request) Response) {
 	defer conn.Close()
+
+	if to := controlReadTimeout.Load(); to > 0 {
+		conn.SetReadDeadline(time.Now().Add(time.Duration(to)))
+	}
 
 	var req Request
 	dec := json.NewDecoder(conn)

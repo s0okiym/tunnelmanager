@@ -8,13 +8,13 @@ import (
 )
 
 const (
-	socksVer5          = 5
-	socksCmdConnect    = 1
-	socksAtypIPv4     = 1
-	socksAtypDomain   = 3
-	socksAtypIPv6     = 4
-	socksAuthNone     = 0
-	socksRepSuccess   = 0
+	socksVer5       = 5
+	socksCmdConnect = 1
+	socksAtypIPv4   = 1
+	socksAtypDomain = 3
+	socksAtypIPv6   = 4
+	socksAuthNone   = 0
+	socksRepSuccess = 0
 )
 
 type socksTarget struct {

@@ -12,7 +12,7 @@ import (
 type channelStatus int
 
 const (
-	chOpen     channelStatus = iota
+	chOpen channelStatus = iota
 	chWriteClosed
 	chClosed
 )
@@ -98,14 +98,18 @@ func (ch *channel) Close() error {
 	ch.rcond.Broadcast()
 	ch.rmu.Unlock()
 
+	// A fully-closed channel is done in both directions; drop it from the
+	// multiplexer so the channel map does not grow per handled connection.
+	ch.ctrl.removeChannel(ch.id)
+
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload, ch.id)
 	return ch.ctrl.sendFrame(FrameChannelClose, payload)
 }
 
-func (ch *channel) LocalAddr() net.Addr     { return nil }
-func (ch *channel) RemoteAddr() net.Addr    { return nil }
-func (ch *channel) SetDeadline(time.Time) error     { return nil }
+func (ch *channel) LocalAddr() net.Addr              { return nil }
+func (ch *channel) RemoteAddr() net.Addr             { return nil }
+func (ch *channel) SetDeadline(time.Time) error      { return nil }
 func (ch *channel) SetReadDeadline(time.Time) error  { return nil }
 func (ch *channel) SetWriteDeadline(time.Time) error { return nil }
 

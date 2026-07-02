@@ -11,16 +11,17 @@ import (
 )
 
 type Manager struct {
-	mu       sync.Mutex
-	cfg      *Config
-	cfgPath  string
-	tunnels  map[string]*managedTunnel
-	stopCh   chan struct{}
+	mu      sync.Mutex
+	cfg     *Config
+	cfgPath string
+	tunnels map[string]*managedTunnel
+	stopCh  chan struct{}
 }
 
 type managedTunnel struct {
 	cfg    TunnelConfig
 	cancel func()
+	done   chan struct{} // closed when the tunnel goroutine has fully returned
 }
 
 func NewManager(cfg *Config, cfgPath string) *Manager {
@@ -56,12 +57,41 @@ func (m *Manager) Stop() error {
 }
 
 func (m *Manager) stopLocked() error {
+	// Cancel everything first, then wait for teardown, so listeners are
+	// released concurrently rather than one-at-a-time.
+	type pending struct {
+		name string
+		done chan struct{}
+	}
+	var waiting []pending
 	for name, mt := range m.tunnels {
 		mt.cancel()
+		waiting = append(waiting, pending{name: name, done: mt.done})
 		delete(m.tunnels, name)
-		log.Printf("manager: stopped %s", name)
+	}
+	for _, p := range waiting {
+		m.waitTunnelStopped(p.name, p.done)
 	}
 	return nil
+}
+
+// waitTunnelStopped blocks until the tunnel goroutine has returned (its
+// listener is released) or a safety timeout elapses.
+func (m *Manager) waitTunnelStopped(name string, done <-chan struct{}) {
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		log.Printf("manager: timeout waiting for %s to stop", name)
+	}
+	log.Printf("manager: stopped %s", name)
+}
+
+// stopTunnelLocked cancels a single tunnel and waits for it to release its
+// resources. Caller must hold m.mu.
+func (m *Manager) stopTunnelLocked(name string, mt *managedTunnel) {
+	mt.cancel()
+	delete(m.tunnels, name)
+	m.waitTunnelStopped(name, mt.done)
 }
 
 func (m *Manager) StopGroup(group string) error {
@@ -70,9 +100,7 @@ func (m *Manager) StopGroup(group string) error {
 
 	for name, mt := range m.tunnels {
 		if mt.cfg.Group == group {
-			mt.cancel()
-			delete(m.tunnels, name)
-			log.Printf("manager: stopped %s (group %s)", name, group)
+			m.stopTunnelLocked(name, mt)
 		}
 	}
 	return nil
@@ -142,8 +170,7 @@ func (m *Manager) Remove(name string) error {
 	defer m.mu.Unlock()
 
 	if mt, ok := m.tunnels[name]; ok {
-		mt.cancel()
-		delete(m.tunnels, name)
+		m.stopTunnelLocked(name, mt)
 	}
 
 	idx := m.findConfig(name)
@@ -152,6 +179,22 @@ func (m *Manager) Remove(name string) error {
 	}
 	m.cfg.Tunnels = append(m.cfg.Tunnels[:idx], m.cfg.Tunnels[idx+1:]...)
 	return SaveConfig(m.cfg, m.cfgPath)
+}
+
+// Reload re-reads the config from disk and restarts all tunnels in place. It
+// holds the manager lock across the whole stop/swap/start so it never races
+// concurrent control requests, and reuses the same Manager instance so a bound
+// control-server handler keeps working after a reload.
+func (m *Manager) Reload() error {
+	newCfg, err := LoadConfig(m.cfgPath)
+	if err != nil {
+		return fmt.Errorf("reload config: %w", err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stopLocked()
+	m.cfg = newCfg
+	return m.startLocked()
 }
 
 func (m *Manager) findConfig(name string) int {
@@ -168,33 +211,33 @@ func (m *Manager) startOne(tc TunnelConfig) error {
 		return nil // already running
 	}
 
-	ctx := make(chan struct{})
-	cancel := func() { close(ctx) }
-
+	var runFn func(<-chan struct{})
 	switch tc.Mode {
 	case "local":
 		if len(tc.Hops) > 0 {
-			go m.runChain(tc, ctx)
+			runFn = func(ctx <-chan struct{}) { m.runChain(tc, ctx) }
 		} else {
-			go m.runLocal(tc, ctx)
+			runFn = func(ctx <-chan struct{}) { m.runLocal(tc, ctx) }
 		}
 	case "dynamic":
-		go m.runDynamic(tc, ctx)
+		runFn = func(ctx <-chan struct{}) { m.runDynamic(tc, ctx) }
 	case "remote":
 		if tc.Server != "" {
 			if tc.Connections > 1 {
-				go m.runRemoteClientMulti(tc, ctx)
+				runFn = func(ctx <-chan struct{}) { m.runRemoteClientMulti(tc, ctx) }
 			} else {
-				go m.runRemoteClient(tc, ctx)
+				runFn = func(ctx <-chan struct{}) { m.runRemoteClient(tc, ctx) }
 			}
 		} else {
-			go m.runRemoteServer(tc, ctx)
+			runFn = func(ctx <-chan struct{}) { m.runRemoteServer(tc, ctx) }
 		}
 	default:
 		return fmt.Errorf("unknown mode %q", tc.Mode)
 	}
 
-	m.tunnels[tc.Name] = &managedTunnel{cfg: tc, cancel: cancel}
+	ctx := make(chan struct{})
+	done := make(chan struct{})
+	cancel := func() { close(ctx) }
 
 	// Start health check if configured
 	if tc.HealthCheck != "" {
@@ -209,6 +252,12 @@ func (m *Manager) startOne(tc TunnelConfig) error {
 		}
 	}
 
+	go func() {
+		defer close(done)
+		runFn(ctx)
+	}()
+
+	m.tunnels[tc.Name] = &managedTunnel{cfg: tc, cancel: cancel, done: done}
 	return nil
 }
 
@@ -456,13 +505,9 @@ func (m *Manager) HandleControl(req Request) Response {
 		return Response{Result: empty, ID: req.ID}
 
 	case "reload":
-		newCfg, err := LoadConfig(m.cfgPath)
-		if err != nil {
-			return Response{Error: fmt.Sprintf("reload config: %v", err), ID: req.ID}
+		if err := m.Reload(); err != nil {
+			return Response{Error: err.Error(), ID: req.ID}
 		}
-		m.stopLocked()
-		m.cfg = newCfg
-		m.startLocked()
 		return Response{Result: empty, ID: req.ID}
 
 	default:

@@ -8,8 +8,8 @@ import (
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
-	if cfg.Global.LogLevel != "info" {
-		t.Fatalf("expected info, got %s", cfg.Global.LogLevel)
+	if len(cfg.Tunnels) != 0 {
+		t.Fatalf("expected no tunnels by default, got %d", len(cfg.Tunnels))
 	}
 }
 
@@ -141,9 +141,9 @@ func TestHandleControl(t *testing.T) {
 
 func managerRequest(method string, params string) Request {
 	return Request{
-		Method:  method,
-		Params:  []byte(params),
-		ID:      1,
+		Method: method,
+		Params: []byte(params),
+		ID:     1,
 	}
 }
 

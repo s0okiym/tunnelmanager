@@ -23,42 +23,37 @@ type Config struct {
 }
 
 type TunnelConfig struct {
-	Name      string   `yaml:"name"`
-	Mode      string   `yaml:"mode"`                // local, remote, dynamic
-	Local     string   `yaml:"local,omitempty"`     // local addr or target
-	Remote    string   `yaml:"remote,omitempty"`    // remote target or server listen port
-	Server    string   `yaml:"server,omitempty"`    // server addr (remote client mode)
-	Token     string   `yaml:"token,omitempty"`     // auth token
-	TLS       bool     `yaml:"tls,omitempty"`       // TLS enabled
-	TLSCert   string   `yaml:"tls_cert,omitempty"`  // TLS cert file (PEM)
-	TLSKey    string   `yaml:"tls_key,omitempty"`   // TLS key file (PEM)
-	TLSVerify bool     `yaml:"tls_verify,omitempty"` // TLS peer certificate verification
-	Protocol  string   `yaml:"protocol,omitempty"`  // tcp (default) or udp
-	Autostart bool     `yaml:"autostart,omitempty"` // start on daemon launch
-	Group     string   `yaml:"group,omitempty"`     // connection group
-	Hops      []string `yaml:"hops,omitempty"`      // multi-hop chain
-	Connections int    `yaml:"connections,omitempty"` // multi-control connections (remote)
-	HealthCheck string `yaml:"health_check,omitempty"` // health check interval (e.g. "10s")
+	Name        string   `yaml:"name"`
+	Mode        string   `yaml:"mode"`                   // local, remote, dynamic
+	Local       string   `yaml:"local,omitempty"`        // local addr or target
+	Remote      string   `yaml:"remote,omitempty"`       // remote target or server listen port
+	Server      string   `yaml:"server,omitempty"`       // server addr (remote client mode)
+	Token       string   `yaml:"token,omitempty"`        // auth token
+	TLS         bool     `yaml:"tls,omitempty"`          // TLS enabled
+	TLSCert     string   `yaml:"tls_cert,omitempty"`     // TLS cert file (PEM)
+	TLSKey      string   `yaml:"tls_key,omitempty"`      // TLS key file (PEM)
+	TLSVerify   bool     `yaml:"tls_verify,omitempty"`   // TLS peer certificate verification
+	Protocol    string   `yaml:"protocol,omitempty"`     // tcp (default) or udp
+	Autostart   bool     `yaml:"autostart,omitempty"`    // start on daemon launch
+	Group       string   `yaml:"group,omitempty"`        // connection group
+	Hops        []string `yaml:"hops,omitempty"`         // multi-hop chain
+	Connections int      `yaml:"connections,omitempty"`  // multi-control connections (remote)
+	HealthCheck string   `yaml:"health_check,omitempty"` // health check interval (e.g. "10s")
 }
 
 type GlobalConfig struct {
-	LogLevel      string `yaml:"log_level,omitempty"`
-	LogFile       string `yaml:"log_file,omitempty"`
-	ControlSocket string `yaml:"control_socket,omitempty"`
-	TLSDir        string `yaml:"tls_dir,omitempty"`
+	LogFile       string `yaml:"log_file,omitempty"`       // redirect daemon logs to this file
+	ControlSocket string `yaml:"control_socket,omitempty"` // override control socket path
 }
 
 func DefaultConfig() Config {
-	return Config{
-		Global: GlobalConfig{
-			LogLevel:      "info",
-			ControlSocket: filepath.Join(DefaultDataDir, "control.sock"),
-			TLSDir:        filepath.Join(DefaultConfigDir, "tls"),
-		},
-	}
+	return Config{}
 }
 
 func LoadConfig(path string) (*Config, error) {
+	if path == "" {
+		path = os.Getenv("TUNNEL_CONFIG")
+	}
 	if path == "" {
 		path = filepath.Join(DefaultConfigDir, "config.yaml")
 	}
