@@ -26,6 +26,7 @@ type Stats struct {
 func Relay(a, b net.Conn) Stats {
 	var s Stats
 	var wg sync.WaitGroup
+	var errMu sync.Mutex
 	wg.Add(2)
 
 	go func() {
@@ -35,7 +36,9 @@ func Relay(a, b net.Conn) Stats {
 		n, err := io.CopyBuffer(b, a, *buf)
 		atomic.StoreInt64(&s.SentBytes, n)
 		if err != nil {
+			errMu.Lock()
 			s.SentErr = err
+			errMu.Unlock()
 		}
 		closeWrite(b)
 	}()
@@ -47,7 +50,9 @@ func Relay(a, b net.Conn) Stats {
 		n, err := io.CopyBuffer(a, b, *buf)
 		atomic.StoreInt64(&s.RecvBytes, n)
 		if err != nil {
+			errMu.Lock()
 			s.RecvErr = err
+			errMu.Unlock()
 		}
 		closeWrite(a)
 	}()

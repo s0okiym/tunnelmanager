@@ -3,6 +3,7 @@ package relay
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -269,6 +270,30 @@ func TestProxyManySmallWrites(t *testing.T) {
 
 	if !bytes.Equal(got, expected.Bytes()) {
 		t.Fatalf("many writes: got %d bytes, want %d", len(got), expected.Len())
+	}
+}
+
+func TestProxyDoneCloses(t *testing.T) {
+	proxy, err := NewProxy("127.0.0.1:0", "127.0.0.1:9999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go proxy.Serve()
+
+	select {
+	case <-proxy.Done():
+		t.Fatal("Done fired before Close")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if err := proxy.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	select {
+	case <-proxy.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Done did not fire after Close")
 	}
 }
 
@@ -646,8 +671,21 @@ func TestSocksConnectRefused(t *testing.T) {
 	var resp [2]byte
 	io.ReadFull(conn, resp[:])
 
-	// connect to unreachable port
-	req := []byte{5, 1, 0, 1, 127, 0, 0, 1, 0, 1} // 127.0.0.1:1
+	// connect to an unreachable port
+	closedLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedAddr := closedLn.Addr().String()
+	closedLn.Close()
+
+	host, port, _ := net.SplitHostPort(closedAddr)
+	ip := net.ParseIP(host).To4()
+	var p uint16
+	fmt.Sscanf(port, "%d", &p)
+	req := []byte{5, 1, 0, 1}
+	req = append(req, ip...)
+	req = append(req, byte(p>>8), byte(p))
 	conn.Write(req)
 
 	var reply [10]byte
@@ -657,6 +695,164 @@ func TestSocksConnectRefused(t *testing.T) {
 	}
 	if n < 4 || reply[0] != 5 || reply[1] == 0 {
 		t.Fatalf("expected failure reply, got rep=%d", reply[1])
+	}
+}
+
+func TestSocksAuthSuccess(t *testing.T) {
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoLn.Close()
+
+	proxy, err := NewSocksProxyWithAuth("127.0.0.1:0", "alice", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go proxy.Serve()
+	defer proxy.Close()
+
+	done := make(chan struct{}, 1)
+	go echoFunc(echoLn, done)
+
+	conn, err := net.Dial("tcp", proxy.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// greeting: offer no-auth and password-auth
+	conn.Write([]byte{5, 2, 0, 2})
+	var method [2]byte
+	if _, err := io.ReadFull(conn, method[:]); err != nil {
+		t.Fatal(err)
+	}
+	if method[0] != 5 || method[1] != 2 {
+		t.Fatalf("expected password auth selected, got %v", method)
+	}
+
+	// password subnegotiation
+	conn.Write([]byte{1, 5, 'a', 'l', 'i', 'c', 'e', 6, 's', 'e', 'c', 'r', 'e', 't'})
+	var authReply [2]byte
+	if _, err := io.ReadFull(conn, authReply[:]); err != nil {
+		t.Fatal(err)
+	}
+	if authReply[0] != 1 || authReply[1] != 0 {
+		t.Fatalf("auth failed: %v", authReply)
+	}
+
+	// connect request
+	host, port, _ := net.SplitHostPort(echoLn.Addr().String())
+	ip := net.ParseIP(host).To4()
+	p := uint16(0)
+	fmt.Sscanf(port, "%d", &p)
+	req := []byte{5, 1, 0, 1}
+	req = append(req, ip...)
+	req = append(req, byte(p>>8), byte(p))
+	conn.Write(req)
+
+	var reply [10]byte
+	if _, err := io.ReadFull(conn, reply[:]); err != nil {
+		t.Fatal(err)
+	}
+	if reply[1] != 0 {
+		t.Fatalf("connect failed: %d", reply[1])
+	}
+
+	conn.Write([]byte("hello\n"))
+	buf := make([]byte, 64)
+	n, _ := conn.Read(buf)
+	if string(buf[:n]) != "hello\n" {
+		t.Fatalf("got %q", buf[:n])
+	}
+}
+
+func TestSocksAuthFailure(t *testing.T) {
+	proxy, err := NewSocksProxyWithAuth("127.0.0.1:0", "alice", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go proxy.Serve()
+	defer proxy.Close()
+
+	conn, err := net.Dial("tcp", proxy.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	conn.Write([]byte{5, 1, 2})
+	var method [2]byte
+	io.ReadFull(conn, method[:])
+	if method[1] != 2 {
+		t.Fatal("password auth not selected")
+	}
+
+	conn.Write([]byte{1, 5, 'a', 'l', 'i', 'c', 'e', 5, 'w', 'r', 'o', 'n', 'g'})
+	var authReply [2]byte
+	if _, err := io.ReadFull(conn, authReply[:]); err != nil {
+		t.Fatal(err)
+	}
+	if authReply[1] == 0 {
+		t.Fatal("expected auth failure")
+	}
+}
+
+func TestSocksNoAuthRejectedWhenRequired(t *testing.T) {
+	proxy, err := NewSocksProxyWithAuth("127.0.0.1:0", "alice", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go proxy.Serve()
+	defer proxy.Close()
+
+	conn, err := net.Dial("tcp", proxy.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// offer only no-auth
+	conn.Write([]byte{5, 1, 0})
+	var method [2]byte
+	if _, err := io.ReadFull(conn, method[:]); err != nil {
+		t.Fatal(err)
+	}
+	if method[1] != 0xff {
+		t.Fatalf("expected no acceptable method, got %d", method[1])
+	}
+}
+
+func TestPackedAddrNonTCP(t *testing.T) {
+	// packedAddr should not panic on a non-TCP address.
+	addr := &net.UnixAddr{Name: "/tmp/x", Net: "unix"}
+	out := packedAddr(addr)
+	if len(out) != 7 || out[0] != socksAtypIPv4 {
+		t.Fatalf("unexpected fallback packed addr: %v", out)
+	}
+}
+
+func TestSocksDoneCloses(t *testing.T) {
+	proxy, err := NewSocksProxy("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go proxy.Serve()
+
+	select {
+	case <-proxy.Done():
+		t.Fatal("Done fired before Close")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if err := proxy.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	select {
+	case <-proxy.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Done did not fire after Close")
 	}
 }
 
@@ -696,6 +892,26 @@ func TestFrameEmptyPayload(t *testing.T) {
 	}
 	if frame.Type != FramePong || len(frame.Payload) != 0 {
 		t.Fatal("expected empty pong")
+	}
+}
+
+func TestFrameOversizedRejected(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	// Craft a header claiming a payload larger than maxFramePayload.
+	header := make([]byte, 5)
+	binary.BigEndian.PutUint32(header[:4], maxFramePayload+1)
+	header[4] = FramePing
+	go a.Write(header)
+
+	_, err := ReadFrame(b)
+	if err == nil {
+		t.Fatal("expected error for oversized frame")
+	}
+	if !bytes.Contains([]byte(err.Error()), []byte("too large")) {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -1051,4 +1267,155 @@ func nameSize(sz int) string {
 	default:
 		return "1MB"
 	}
+}
+
+// TestChannelFlowControlSlowReader verifies that a Write larger than the
+// initial send window blocks until the receiver reads enough data to replenish
+// the window. This prevents unbounded memory growth on a slow consumer.
+func TestChannelFlowControlSlowReader(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	cca := NewCtrlConn(a)
+	ccb := NewCtrlConn(b)
+
+	serverChReady := make(chan *channel, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		ch, err := ccb.AcceptChannel()
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		serverChReady <- ch
+
+		// Slow consumer: wait before reading the whole payload.
+		time.Sleep(300 * time.Millisecond)
+		buf := make([]byte, defaultSendWindow+1)
+		n, err := io.ReadFull(ch, buf)
+		if err != nil {
+			t.Errorf("read: %v", err)
+			return
+		}
+		if n != defaultSendWindow+1 {
+			t.Errorf("expected %d bytes, got %d", defaultSendWindow+1, n)
+		}
+		ch.Close()
+	}()
+
+	clientCh, err := cca.OpenChannel("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientCh.Close()
+
+	serverCh := <-serverChReady
+	_ = serverCh
+
+	payload := make([]byte, defaultSendWindow+1)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := clientCh.Write(payload)
+		writeDone <- err
+	}()
+
+	// The write should not complete immediately because it exceeds the window.
+	select {
+	case err := <-writeDone:
+		if err == nil {
+			t.Fatal("write should have blocked until the reader consumed data")
+		}
+		t.Fatalf("unexpected write error: %v", err)
+	case <-time.After(100 * time.Millisecond):
+		// expected: blocked
+	}
+
+	// After the slow reader consumes the data, the write unblocks.
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("write did not unblock after reader consumed data")
+	}
+
+	<-serverDone
+}
+
+// TestChannelFlowControlHeadOfLineBlocking verifies that one channel whose
+// receiver is stalled does not prevent another channel from transmitting data
+// on the same control connection.
+func TestChannelFlowControlHeadOfLineBlocking(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	cca := NewCtrlConn(a)
+	ccb := NewCtrlConn(b)
+
+	serverChs := make(chan [2]*channel, 1)
+	go func() {
+		ch0, err := ccb.AcceptChannel()
+		if err != nil {
+			t.Errorf("accept ch0: %v", err)
+			return
+		}
+		ch1, err := ccb.AcceptChannel()
+		if err != nil {
+			t.Errorf("accept ch1: %v", err)
+			return
+		}
+		serverChs <- [2]*channel{ch0, ch1}
+	}()
+
+	clientCh0, err := cca.OpenChannel("target0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientCh0.Close()
+	clientCh1, err := cca.OpenChannel("target1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientCh1.Close()
+
+	chs := <-serverChs
+	serverCh0, serverCh1 := chs[0], chs[1]
+
+	// Fill ch0's send window so subsequent writes block.
+	fill := make([]byte, defaultSendWindow)
+	if _, err := clientCh0.Write(fill); err != nil {
+		t.Fatalf("fill ch0: %v", err)
+	}
+
+	// ch1 should still be able to send and receive data promptly.
+	msg := []byte("hello through ch1")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, len(msg))
+		if _, err := io.ReadFull(serverCh1, buf); err != nil {
+			t.Errorf("read ch1: %v", err)
+			return
+		}
+		if string(buf) != string(msg) {
+			t.Errorf("ch1 data mismatch")
+		}
+	}()
+
+	if _, err := clientCh1.Write(msg); err != nil {
+		t.Fatalf("write ch1: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ch1 blocked by stalled ch0")
+	}
+
+	serverCh0.Close()
+	serverCh1.Close()
 }

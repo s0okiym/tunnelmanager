@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -32,13 +33,15 @@ type Response struct {
 }
 
 type TunnelStatus struct {
-	Name   string `json:"name"`
-	Mode   string `json:"mode"`
-	Local  string `json:"local"`
-	Remote string `json:"remote"`
-	Status string `json:"status"`
-	Group  string `json:"group,omitempty"`
-	Error  string `json:"error,omitempty"`
+	Name           string    `json:"name"`
+	Mode           string    `json:"mode"`
+	Local          string    `json:"local"`
+	Remote         string    `json:"remote"`
+	Status         string    `json:"status"`
+	Group          string    `json:"group,omitempty"`
+	Error          string    `json:"error,omitempty"`
+	Since          time.Time `json:"since,omitempty"`
+	ReconnectCount int64     `json:"reconnect_count,omitempty"`
 }
 
 // controlSocketOverride, when non-empty, replaces the default control socket
@@ -66,7 +69,11 @@ func ServeControl(handler func(Request) Response, stop <-chan struct{}) error {
 	os.Remove(path)
 	os.MkdirAll(filepath.Dir(path), 0755)
 
+	// Create the socket with owner-only permissions from the start. net.Listen
+	// honors the process umask, so restrict it temporarily and then restore.
+	oldMask := syscall.Umask(0177)
 	ln, err := net.Listen("unix", path)
+	syscall.Umask(oldMask)
 	if err != nil {
 		return fmt.Errorf("control listen: %w", err)
 	}

@@ -9,7 +9,10 @@ import (
 
 type SocksProxy struct {
 	listener  net.Listener
+	user      string
+	pass      string
 	done      chan struct{}
+	closeDone sync.Once
 	closed    atomic.Bool
 	mu        sync.Mutex
 	stats     Stats
@@ -17,12 +20,18 @@ type SocksProxy struct {
 }
 
 func NewSocksProxy(listenAddr string) (*SocksProxy, error) {
+	return NewSocksProxyWithAuth(listenAddr, "", "")
+}
+
+func NewSocksProxyWithAuth(listenAddr, user, pass string) (*SocksProxy, error) {
 	l, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, err
 	}
 	return &SocksProxy{
 		listener: l,
+		user:     user,
+		pass:     pass,
 		done:     make(chan struct{}),
 	}, nil
 }
@@ -47,7 +56,7 @@ func (p *SocksProxy) Serve() error {
 func (p *SocksProxy) handle(conn net.Conn) {
 	defer conn.Close()
 
-	target, err := socksHandshake(conn)
+	target, err := socksHandshake(conn, p.user, p.pass)
 	if err != nil {
 		return
 	}
@@ -65,6 +74,7 @@ func (p *SocksProxy) handle(conn net.Conn) {
 	}
 
 	p.connCount.Add(1)
+	defer p.connCount.Add(-1)
 	s := Relay(upstream, conn)
 
 	p.mu.Lock()
@@ -87,7 +97,9 @@ func (p *SocksProxy) Stats() Stats {
 
 func (p *SocksProxy) Close() error {
 	p.closed.Store(true)
-	return p.listener.Close()
+	err := p.listener.Close()
+	p.closeDone.Do(func() { close(p.done) })
+	return err
 }
 
 func (p *SocksProxy) Done() <-chan struct{} {
@@ -103,7 +115,11 @@ func ListenSocks(addr string) (net.Listener, error) {
 }
 
 func packedAddr(addr net.Addr) []byte {
-	tcp := addr.(*net.TCPAddr)
+	tcp, ok := addr.(*net.TCPAddr)
+	if !ok {
+		// Fallback for non-TCP upstream addresses: report 0.0.0.0:0.
+		return append([]byte{socksAtypIPv4}, append([]byte{0, 0, 0, 0}, 0, 0)...)
+	}
 	ip := tcp.IP
 	port := make([]byte, 2)
 	port[0] = byte(tcp.Port >> 8)

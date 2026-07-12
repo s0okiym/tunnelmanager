@@ -71,6 +71,8 @@ func (cc *CtrlConn) handleFrame(f Frame) {
 		cc.handleChannelData(f.Payload)
 	case FrameChannelClose:
 		cc.handleChannelClose(f.Payload)
+	case FrameWindowUpdate:
+		cc.handleWindowUpdate(f.Payload)
 	case FramePing:
 		cc.handlePing(f.Payload)
 	case FramePong:
@@ -126,6 +128,22 @@ func (cc *CtrlConn) handleChannelClose(payload []byte) {
 
 	if ok {
 		ch.setError(io.EOF)
+	}
+}
+
+func (cc *CtrlConn) handleWindowUpdate(payload []byte) {
+	if len(payload) < 8 {
+		return
+	}
+	chID := binary.BigEndian.Uint32(payload[:4])
+	delta := binary.BigEndian.Uint32(payload[4:8])
+
+	cc.cmu.Lock()
+	ch, ok := cc.channels[chID]
+	cc.cmu.Unlock()
+
+	if ok {
+		ch.addSendWindow(int64(delta))
 	}
 }
 
@@ -189,6 +207,7 @@ func (cc *CtrlConn) AcceptChannel() (*channel, error) {
 
 type RemoteTunnel struct {
 	RemotePort uint16
+	BindAddr   string // address the server listens on; empty means 0.0.0.0
 	TargetAddr string // e.g. "localhost:8080"
 }
 
@@ -201,6 +220,11 @@ func packTunnels(tunnels []RemoteTunnel) []byte {
 		port := make([]byte, 2)
 		binary.BigEndian.PutUint16(port, t.RemotePort)
 		buf = append(buf, port...)
+		bindBytes := []byte(t.BindAddr)
+		bindLen := make([]byte, 2)
+		binary.BigEndian.PutUint16(bindLen, uint16(len(bindBytes)))
+		buf = append(buf, bindLen...)
+		buf = append(buf, bindBytes...)
 		targetBytes := []byte(t.TargetAddr)
 		targetLen := make([]byte, 2)
 		binary.BigEndian.PutUint16(targetLen, uint16(len(targetBytes)))
@@ -222,14 +246,24 @@ func unpackTunnels(data []byte) ([]RemoteTunnel, error) {
 			return nil, fmt.Errorf("short tunnel entry")
 		}
 		port := binary.BigEndian.Uint16(data[:2])
-		targetLen := binary.BigEndian.Uint16(data[2:4])
+		bindLen := binary.BigEndian.Uint16(data[2:4])
 		data = data[4:]
+		if len(data) < int(bindLen) {
+			return nil, fmt.Errorf("short bind address")
+		}
+		bind := string(data[:bindLen])
+		data = data[bindLen:]
+		if len(data) < 2 {
+			return nil, fmt.Errorf("short target length")
+		}
+		targetLen := binary.BigEndian.Uint16(data[:2])
+		data = data[2:]
 		if len(data) < int(targetLen) {
 			return nil, fmt.Errorf("short target address")
 		}
 		target := string(data[:targetLen])
 		data = data[targetLen:]
-		tunnels = append(tunnels, RemoteTunnel{RemotePort: port, TargetAddr: target})
+		tunnels = append(tunnels, RemoteTunnel{RemotePort: port, BindAddr: bind, TargetAddr: target})
 	}
 	return tunnels, nil
 }

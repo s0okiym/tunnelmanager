@@ -17,6 +17,17 @@ type RemoteServer struct {
 	closed bool
 	wg     sync.WaitGroup
 	done   chan struct{}
+
+	// listeners holds the per-bind:port shared public listener. Multiple control
+	// connections may register the same remote port and bind address; they share
+	// one listener and incoming connections are distributed round-robin across
+	// the control connections.
+	listeners map[listenerKey]*sharedListener
+}
+
+type listenerKey struct {
+	port uint16
+	bind string
 }
 
 func NewRemoteServer(listenAddr, token string, tlsCfg *TLSConfig) (*RemoteServer, error) {
@@ -36,11 +47,12 @@ func NewRemoteServer(listenAddr, token string, tlsCfg *TLSConfig) (*RemoteServer
 	}
 
 	return &RemoteServer{
-		ctrlLn: ln,
-		token:  token,
-		tlsCfg: tlsCfg,
-		conns:  make(map[*CtrlConn]struct{}),
-		done:   make(chan struct{}),
+		ctrlLn:    ln,
+		token:     token,
+		tlsCfg:    tlsCfg,
+		conns:     make(map[*CtrlConn]struct{}),
+		listeners: make(map[listenerKey]*sharedListener),
+		done:      make(chan struct{}),
 	}, nil
 }
 
@@ -94,7 +106,7 @@ func (rs *RemoteServer) handleClient(conn net.Conn) {
 
 	for _, t := range tunnels {
 		rs.wg.Add(1)
-		go rs.serveRemoteTunnel(cc, t.RemotePort, t.TargetAddr)
+		go rs.serveRemoteTunnel(cc, t.RemotePort, t.BindAddr, t.TargetAddr)
 	}
 
 	<-cc.Done()
@@ -116,51 +128,188 @@ func (rs *RemoteServer) untrackConn(cc *CtrlConn) {
 	rs.mu.Unlock()
 }
 
-func (rs *RemoteServer) serveRemoteTunnel(cc *CtrlConn, remotePort uint16, targetAddr string) {
+func defaultBindAddr(addr string) string {
+	if addr == "" {
+		return "0.0.0.0"
+	}
+	return addr
+}
+
+func (rs *RemoteServer) serveRemoteTunnel(cc *CtrlConn, remotePort uint16, bindAddr, targetAddr string) {
 	defer rs.wg.Done()
 
-	listenAddr := fmt.Sprintf("0.0.0.0:%d", remotePort)
-	ln, err := listenTunnel(listenAddr, cc)
+	sl, err := rs.attachSharedListener(remotePort, bindAddr, targetAddr, cc)
 	if err != nil {
-		log.Printf("remote: cannot listen on %s: %v", listenAddr, err)
+		log.Printf("remote: cannot listen on %s:%d: %v", defaultBindAddr(bindAddr), remotePort, err)
 		return
 	}
-	defer ln.Close()
 
-	// Release the listener as soon as the control connection dies, so the port
-	// is freed for the next (re)connection and the Accept below unblocks.
-	go func() {
-		<-cc.Done()
-		ln.Close()
-	}()
+	log.Printf("remote: listening on %s:%d -> target %s", defaultBindAddr(bindAddr), remotePort, targetAddr)
 
-	log.Printf("remote: listening on %s -> target %s", listenAddr, targetAddr)
+	// Wait until this control connection dies, then detach it from the shared
+	// listener. The shared listener stays open as long as at least one control
+	// connection is registered for this bind:port.
+	<-cc.Done()
+	rs.detachSharedListener(sl, cc)
+}
+
+// sharedListener is a single public listener shared by multiple control
+// connections that have registered the same remote port and bind address.
+// Incoming connections are distributed round-robin across the registered
+// control connections.
+type sharedListener struct {
+	rs       *RemoteServer
+	port     uint16
+	bindAddr string
+	ln       net.Listener
+	mu       sync.Mutex
+	conns    map[*CtrlConn]string // control conn -> target address
+	order    []*CtrlConn          // round-robin order
+	next     int                  // index of next control conn to use
+	closed   bool
+}
+
+func (rs *RemoteServer) attachSharedListener(port uint16, bindAddr, target string, cc *CtrlConn) (*sharedListener, error) {
+	key := listenerKey{port: port, bind: bindAddr}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.closed {
+		return nil, fmt.Errorf("server closed")
+	}
+
+	if sl, ok := rs.listeners[key]; ok {
+		sl.mu.Lock()
+		if !sl.closed {
+			// Update the target if this control connection is already
+			// registered, otherwise append it.
+			if _, exists := sl.conns[cc]; !exists {
+				sl.conns[cc] = target
+				sl.order = append(sl.order, cc)
+			} else {
+				sl.conns[cc] = target
+			}
+			sl.mu.Unlock()
+			return sl, nil
+		}
+		// Stale entry: the listener was closed but not yet removed.
+		sl.mu.Unlock()
+		delete(rs.listeners, key)
+	}
+
+	listenAddr := net.JoinHostPort(defaultBindAddr(bindAddr), fmt.Sprintf("%d", port))
+	ln, err := listenTunnel(listenAddr, cc)
+	if err != nil {
+		return nil, err
+	}
+
+	sl := &sharedListener{
+		rs:       rs,
+		port:     port,
+		bindAddr: bindAddr,
+		ln:       ln,
+		conns:    map[*CtrlConn]string{cc: target},
+		order:    []*CtrlConn{cc},
+	}
+	rs.listeners[key] = sl
+	rs.wg.Add(1)
+	go sl.acceptLoop()
+	return sl, nil
+}
+
+func (rs *RemoteServer) detachSharedListener(sl *sharedListener, cc *CtrlConn) {
+	sl.mu.Lock()
+	if _, ok := sl.conns[cc]; !ok {
+		sl.mu.Unlock()
+		return
+	}
+	delete(sl.conns, cc)
+
+	// Remove cc from round-robin order and adjust next index.
+	idx := -1
+	for i, c := range sl.order {
+		if c == cc {
+			idx = i
+			break
+		}
+	}
+	if idx >= 0 {
+		sl.order = append(sl.order[:idx], sl.order[idx+1:]...)
+		if sl.next > idx {
+			sl.next--
+		}
+		if sl.next >= len(sl.order) {
+			sl.next = 0
+		}
+	}
+
+	shouldClose := len(sl.order) == 0
+	sl.mu.Unlock()
+
+	if shouldClose {
+		sl.Close()
+		rs.mu.Lock()
+		key := listenerKey{port: sl.port, bind: sl.bindAddr}
+		if rs.listeners[key] == sl {
+			delete(rs.listeners, key)
+		}
+		rs.mu.Unlock()
+	}
+}
+
+func (sl *sharedListener) acceptLoop() {
+	defer sl.rs.wg.Done()
 
 	for {
-		conn, err := ln.Accept()
+		conn, err := sl.ln.Accept()
 		if err != nil {
-			select {
-			case <-cc.Done():
-				// listener was closed on control-connection teardown
-			default:
-				log.Printf("remote: accept on %s: %v", listenAddr, err)
+			sl.mu.Lock()
+			closed := sl.closed
+			sl.mu.Unlock()
+			if closed {
+				return
 			}
+			log.Printf("remote: accept on %s:%d: %v", defaultBindAddr(sl.bindAddr), sl.port, err)
 			return
 		}
-
-		ch, err := cc.OpenChannel(targetAddr)
-		if err != nil {
-			log.Printf("remote: open channel for %s: %v", targetAddr, err)
-			conn.Close()
-			return
-		}
-
-		go func() {
-			defer conn.Close()
-			defer ch.Close()
-			Relay(conn, ch)
-		}()
+		sl.dispatch(conn)
 	}
+}
+
+func (sl *sharedListener) dispatch(conn net.Conn) {
+	sl.mu.Lock()
+	if len(sl.order) == 0 {
+		sl.mu.Unlock()
+		conn.Close()
+		return
+	}
+	cc := sl.order[sl.next%len(sl.order)]
+	target := sl.conns[cc]
+	sl.next = (sl.next + 1) % len(sl.order)
+	sl.mu.Unlock()
+
+	ch, err := cc.OpenChannel(target)
+	if err != nil {
+		log.Printf("remote: open channel for %s: %v", target, err)
+		conn.Close()
+		return
+	}
+
+	go func() {
+		defer conn.Close()
+		defer ch.Close()
+		Relay(conn, ch)
+	}()
+}
+
+func (sl *sharedListener) Close() {
+	sl.mu.Lock()
+	if sl.closed {
+		sl.mu.Unlock()
+		return
+	}
+	sl.closed = true
+	sl.mu.Unlock()
+	sl.ln.Close()
 }
 
 // listenTunnel binds addr, retrying briefly if the port is still held by a
@@ -195,12 +344,19 @@ func (rs *RemoteServer) Close() error {
 	for cc := range rs.conns {
 		conns = append(conns, cc)
 	}
+	listeners := make([]*sharedListener, 0, len(rs.listeners))
+	for _, sl := range rs.listeners {
+		listeners = append(listeners, sl)
+	}
 	rs.mu.Unlock()
 
 	close(rs.done)
 	err := rs.ctrlLn.Close()
 	for _, cc := range conns {
 		cc.Close()
+	}
+	for _, sl := range listeners {
+		sl.Close()
 	}
 	return err
 }

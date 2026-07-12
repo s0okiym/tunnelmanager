@@ -5,18 +5,21 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type RemoteClient struct {
-	serverAddr string
-	token      string
-	tlsCfg     *TLSConfig
-	tunnels    []RemoteTunnel
-	wg         sync.WaitGroup
-	stopCh     chan struct{}
-	cc         *CtrlConn
-	mu         sync.Mutex
+	serverAddr     string
+	token          string
+	tlsCfg         *TLSConfig
+	tunnels        []RemoteTunnel
+	wg             sync.WaitGroup
+	stopCh         chan struct{}
+	cc             *CtrlConn
+	mu             sync.Mutex
+	lastErr        atomic.Value
+	reconnectCount atomic.Int64
 }
 
 func NewRemoteClient(serverAddr, token string, tlsCfg *TLSConfig, tunnels []RemoteTunnel) *RemoteClient {
@@ -26,6 +29,31 @@ func NewRemoteClient(serverAddr, token string, tlsCfg *TLSConfig, tunnels []Remo
 		tlsCfg:     tlsCfg,
 		tunnels:    tunnels,
 		stopCh:     make(chan struct{}),
+	}
+}
+
+// LastError returns the most recent non-nil error encountered by the client.
+func (rc *RemoteClient) LastError() error {
+	v := rc.lastErr.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(error)
+}
+
+func (rc *RemoteClient) ReconnectCount() int64 {
+	return rc.reconnectCount.Load()
+}
+
+func (rc *RemoteClient) IsConnected() bool {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	return rc.cc != nil
+}
+
+func (rc *RemoteClient) setLastErr(err error) {
+	if err != nil {
+		rc.lastErr.Store(err)
 	}
 }
 
@@ -49,7 +77,9 @@ func (rc *RemoteClient) Run() {
 			}
 			delay := BackoffDelay(backoff, attempt)
 			attempt++
+			rc.reconnectCount.Add(1)
 			log.Printf("remote: connection failed (%v), reconnecting in %v (attempt %d)", err, delay, attempt)
+			rc.setLastErr(err)
 			select {
 			case <-time.After(delay):
 			case <-rc.stopCh:
@@ -112,6 +142,7 @@ func (rc *RemoteClient) handleChannels(cc *CtrlConn) {
 	for {
 		ch, err := cc.AcceptChannel()
 		if err != nil {
+			rc.setLastErr(fmt.Errorf("accept channel: %w", err))
 			log.Printf("remote: accept channel: %v", err)
 			return
 		}
@@ -126,6 +157,7 @@ func (rc *RemoteClient) relayChannel(ch *channel) {
 
 	local, err := net.DialTimeout("tcp", ch.target, 10*time.Second)
 	if err != nil {
+		rc.setLastErr(fmt.Errorf("dial local target %s: %w", ch.target, err))
 		log.Printf("remote: dial local target %s: %v", ch.target, err)
 		ch.Close()
 		return

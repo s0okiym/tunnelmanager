@@ -23,22 +23,26 @@ type Config struct {
 }
 
 type TunnelConfig struct {
-	Name        string   `yaml:"name"`
-	Mode        string   `yaml:"mode"`                   // local, remote, dynamic
-	Local       string   `yaml:"local,omitempty"`        // local addr or target
-	Remote      string   `yaml:"remote,omitempty"`       // remote target or server listen port
-	Server      string   `yaml:"server,omitempty"`       // server addr (remote client mode)
-	Token       string   `yaml:"token,omitempty"`        // auth token
-	TLS         bool     `yaml:"tls,omitempty"`          // TLS enabled
-	TLSCert     string   `yaml:"tls_cert,omitempty"`     // TLS cert file (PEM)
-	TLSKey      string   `yaml:"tls_key,omitempty"`      // TLS key file (PEM)
-	TLSVerify   bool     `yaml:"tls_verify,omitempty"`   // TLS peer certificate verification
-	Protocol    string   `yaml:"protocol,omitempty"`     // tcp (default) or udp
-	Autostart   bool     `yaml:"autostart,omitempty"`    // start on daemon launch
-	Group       string   `yaml:"group,omitempty"`        // connection group
-	Hops        []string `yaml:"hops,omitempty"`         // multi-hop chain
-	Connections int      `yaml:"connections,omitempty"`  // multi-control connections (remote)
-	HealthCheck string   `yaml:"health_check,omitempty"` // health check interval (e.g. "10s")
+	Name                 string   `yaml:"name"`
+	Mode                 string   `yaml:"mode"`                             // local, remote, dynamic
+	Local                string   `yaml:"local,omitempty"`                  // local addr or target
+	Remote               string   `yaml:"remote,omitempty"`                 // remote target or server listen port
+	Server               string   `yaml:"server,omitempty"`                 // server addr (remote client mode)
+	Token                string   `yaml:"token,omitempty"`                  // auth token
+	TLS                  bool     `yaml:"tls,omitempty"`                    // TLS enabled
+	TLSCert              string   `yaml:"tls_cert,omitempty"`               // TLS cert file (PEM)
+	TLSKey               string   `yaml:"tls_key,omitempty"`                // TLS key file (PEM)
+	TLSVerify            bool     `yaml:"tls_verify,omitempty"`             // TLS peer certificate verification
+	TLSTrustOnFirstUse   bool     `yaml:"tls_trust_on_first_use,omitempty"` // trust server fingerprint on first connect
+	TLSServerFingerprint string   `yaml:"tls_server_fingerprint,omitempty"` // pinned server certificate fingerprint
+	Protocol             string   `yaml:"protocol,omitempty"`               // tcp (default) or udp
+	Autostart            bool     `yaml:"autostart,omitempty"`              // start on daemon launch
+	Group                string   `yaml:"group,omitempty"`                  // connection group
+	Hops                 []string `yaml:"hops,omitempty"`                   // multi-hop chain
+	Connections          int      `yaml:"connections,omitempty"`            // multi-control connections (remote)
+	HealthCheck          string   `yaml:"health_check,omitempty"`           // health check interval (e.g. "10s")
+	SocksUser            string   `yaml:"socks_user,omitempty"`             // SOCKS5 username
+	SocksPass            string   `yaml:"socks_pass,omitempty"`             // SOCKS5 password
 }
 
 type GlobalConfig struct {
@@ -83,5 +87,5 @@ func SaveConfig(cfg *Config, path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0600)
 }

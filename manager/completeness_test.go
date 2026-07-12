@@ -44,7 +44,23 @@ func TestWriteSystemdUnitUserCreatesDir(t *testing.T) {
 	}
 }
 
-// TestControlSocketOverride verifies a configured control socket path is honored.
+// TestSaveConfigPermissions verifies the config file is written owner-only.
+func TestSaveConfigPermissions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	cfg := DefaultConfig()
+	cfg.Tunnels = []TunnelConfig{{Name: "secret", Token: "hunter2"}}
+	if err := SaveConfig(&cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Fatalf("config file perms = %o, want 0600", perm)
+	}
+}
 func TestControlSocketOverride(t *testing.T) {
 	orig := controlSocketOverride
 	defer func() { controlSocketOverride = orig }()

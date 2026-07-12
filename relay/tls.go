@@ -1,24 +1,22 @@
 package relay
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
+	"errors"
 	"fmt"
-	"math/big"
 	"net"
-	"time"
 )
 
 type TLSConfig struct {
-	Enabled  bool
-	Cert     tls.Certificate
-	Insecure bool
-	CertFile string
-	KeyFile  string
+	Enabled           bool
+	Cert              tls.Certificate
+	Insecure          bool
+	CertFile          string
+	KeyFile           string
+	Fingerprint       string // server identity fingerprint, for logging
+	TrustOnFirstUse   bool
+	ServerFingerprint string
+	KnownHosts        *KnownHosts
 }
 
 func NewTLSConfig(insecure bool) *TLSConfig {
@@ -26,66 +24,44 @@ func NewTLSConfig(insecure bool) *TLSConfig {
 }
 
 // SetupTLS returns a TLSConfig. If certFile and keyFile are non-empty, loads
-// them via tls.LoadX509KeyPair; otherwise generates an auto self-signed cert.
+// them via tls.LoadX509KeyPair; otherwise uses a persistent auto-generated
+// identity if DefaultIdentityDir is set, falling back to an ephemeral cert.
 // When verify is true, Insecure is set to false (peer certificate is verified).
 // When verify is false, Insecure is set to true (peer certificate is skipped).
 func SetupTLS(certFile, keyFile string, verify bool) (*TLSConfig, error) {
 	var cert tls.Certificate
+	var fp string
 	var err error
 	if certFile != "" && keyFile != "" {
 		cert, err = tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("tls cert: %w", err)
+		}
+		fp, err = tlsCertFingerprint(cert)
+		if err != nil {
+			return nil, fmt.Errorf("tls fingerprint: %w", err)
+		}
 	} else {
-		cert, err = GenerateCert()
+		cert, fp, err = LoadOrGenerateIdentity(DefaultIdentityDir)
+		if err != nil {
+			return nil, fmt.Errorf("tls identity: %w", err)
+		}
 	}
-	if err != nil {
-		return nil, fmt.Errorf("tls cert: %w", err)
-	}
-	return &TLSConfig{Enabled: true, Cert: cert, Insecure: !verify}, nil
+	return &TLSConfig{Enabled: true, Cert: cert, Insecure: !verify, Fingerprint: fp}, nil
 }
 
-// SetupTLSCert returns tls.Certificate from files or auto-generated as fallback.
-func SetupTLSCert(certFile, keyFile string) (tls.Certificate, error) {
+// SetupTLSCert returns tls.Certificate from files or the persistent auto-generated
+// identity as fallback.
+func SetupTLSCert(certFile, keyFile string) (tls.Certificate, string, error) {
 	if certFile != "" && keyFile != "" {
-		return tls.LoadX509KeyPair(certFile, keyFile)
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return tls.Certificate{}, "", err
+		}
+		fp, err := tlsCertFingerprint(cert)
+		return cert, fp, err
 	}
-	return GenerateCert()
-}
-
-func GenerateCert() (tls.Certificate, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("generate key: %w", err)
-	}
-
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("serial: %w", err)
-	}
-
-	now := time.Now()
-	tmpl := &x509.Certificate{
-		SerialNumber: serial,
-		Subject: pkix.Name{
-			CommonName:   "tunnel",
-			Organization: []string{"tunnel"},
-		},
-		NotBefore:             now.Add(-time.Hour),
-		NotAfter:              now.Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
-	}
-
-	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("create cert: %w", err)
-	}
-
-	return tls.Certificate{
-		Certificate: [][]byte{certDER},
-		PrivateKey:  key,
-	}, nil
+	return LoadOrGenerateIdentity(DefaultIdentityDir)
 }
 
 func TLSListener(addr string, cfg *TLSConfig) (net.Listener, error) {
@@ -93,9 +69,8 @@ func TLSListener(addr string, cfg *TLSConfig) (net.Listener, error) {
 		Certificates: []tls.Certificate{cfg.Cert},
 		MinVersion:   tls.VersionTLS13,
 	}
-	if cfg.Insecure {
-		tlsCfg.InsecureSkipVerify = true
-	}
+	// InsecureSkipVerify only affects client-side verification; it is ignored
+	// by tls.Listen. We intentionally do not set it here.
 	ln, err := tls.Listen("tcp", addr, tlsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("tls listen: %w", err)
@@ -107,12 +82,56 @@ func TLSDial(addr string, cfg *TLSConfig) (net.Conn, error) {
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS13,
 	}
-	if cfg.Insecure {
+	manualVerify := cfg.TrustOnFirstUse || cfg.ServerFingerprint != ""
+	if cfg.Insecure || manualVerify {
 		tlsCfg.InsecureSkipVerify = true
 	}
 	conn, err := tls.Dial("tcp", addr, tlsCfg)
 	if err != nil {
 		return nil, fmt.Errorf("tls dial: %w", err)
 	}
+
+	if manualVerify {
+		if err := verifyServerFingerprint(addr, conn, cfg); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
 	return conn, nil
+}
+
+func verifyServerFingerprint(addr string, conn *tls.Conn, cfg *TLSConfig) error {
+	state := conn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		return fmt.Errorf("tls: server presented no certificate")
+	}
+	leaf := state.PeerCertificates[0]
+	fp := PeerFingerprint(leaf)
+
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	key := addr
+
+	if cfg.ServerFingerprint != "" {
+		if fp != cfg.ServerFingerprint {
+			return fmt.Errorf("tls: server %s fingerprint mismatch: expected %s, got %s", host, cfg.ServerFingerprint, fp)
+		}
+		return nil
+	}
+
+	if cfg.KnownHosts == nil {
+		return fmt.Errorf("tls: trust-on-first-use requested but no known_hosts store configured")
+	}
+	if err := cfg.KnownHosts.Verify(key, fp); err != nil {
+		if errors.Is(err, ErrUnknownHost) {
+			if aerr := cfg.KnownHosts.Accept(key, fp); aerr != nil {
+				return fmt.Errorf("tls: trust-on-first-use failed: %w", aerr)
+			}
+			return nil
+		}
+		return fmt.Errorf("tls: %w", err)
+	}
+	return nil
 }

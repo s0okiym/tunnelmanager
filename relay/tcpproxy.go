@@ -10,6 +10,7 @@ type Proxy struct {
 	listener  net.Listener
 	dialAddr  string
 	done      chan struct{}
+	closeDone sync.Once
 	closed    atomic.Bool
 	mu        sync.Mutex
 	stats     Stats
@@ -67,6 +68,7 @@ func (p *Proxy) handle(downstream net.Conn) {
 	defer upstream.Close()
 
 	p.connCount.Add(1)
+	defer p.connCount.Add(-1)
 	s := Relay(upstream, downstream)
 
 	p.mu.Lock()
@@ -89,7 +91,9 @@ func (p *Proxy) Stats() Stats {
 
 func (p *Proxy) Close() error {
 	p.closed.Store(true)
-	return p.listener.Close()
+	err := p.listener.Close()
+	p.closeDone.Do(func() { close(p.done) })
+	return err
 }
 
 func (p *Proxy) Done() <-chan struct{} {

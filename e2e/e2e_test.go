@@ -2,13 +2,20 @@ package e2e
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"os"
+	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -34,6 +41,88 @@ func halfCloseTCP(c net.Conn) {
 	case interface{ CloseWrite() error }:
 		conn.CloseWrite()
 	}
+}
+
+// writeTestCertFiles generates a fresh CA + server certificate chain and writes
+// the server cert, server key, and CA cert to temporary files. The caller must
+// use the returned paths before the test ends (files are removed by t.Cleanup).
+func writeTestCertFiles(t *testing.T) (certFile, keyFile, caFile string) {
+	t.Helper()
+
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate CA key: %v", err)
+	}
+	caSerial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatalf("CA serial: %v", err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          caSerial,
+		Subject:               pkix.Name{CommonName: "test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create CA cert: %v", err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatalf("parse CA cert: %v", err)
+	}
+
+	serverKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate server key: %v", err)
+	}
+	serverSerial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatalf("server serial: %v", err)
+	}
+	serverTmpl := &x509.Certificate{
+		SerialNumber: serverSerial,
+		Subject:      pkix.Name{CommonName: "test-server"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	serverDER, err := x509.CreateCertificate(rand.Reader, serverTmpl, caCert, &serverKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create server cert: %v", err)
+	}
+
+	dir := t.TempDir()
+	certFile = filepath.Join(dir, "srv.pem")
+	keyFile = filepath.Join(dir, "srv-key.pem")
+	caFile = filepath.Join(dir, "ca.pem")
+
+	writePEM := func(path string, typ string, bytes []byte) {
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatalf("create %s: %v", path, err)
+		}
+		defer f.Close()
+		if err := pem.Encode(f, &pem.Block{Type: typ, Bytes: bytes}); err != nil {
+			t.Fatalf("encode %s: %v", path, err)
+		}
+	}
+
+	writePEM(certFile, "CERTIFICATE", serverDER)
+
+	serverKeyBytes, err := x509.MarshalECPrivateKey(serverKey)
+	if err != nil {
+		t.Fatalf("marshal server key: %v", err)
+	}
+	writePEM(keyFile, "EC PRIVATE KEY", serverKeyBytes)
+	writePEM(caFile, "CERTIFICATE", caDER)
+
+	return certFile, keyFile, caFile
 }
 
 func startEcho(t *testing.T) (net.Listener, chan struct{}) {
@@ -264,7 +353,73 @@ func TestE2ELocalProxyConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-// ─── 2. SOCKS5 E2E ──────────────────────────────────────────────────────
+// ─── 2. UDP E2E ─────────────────────────────────────────────────────────
+
+func startUDPEcho(t *testing.T) (*net.UDPConn, chan struct{}) {
+	t.Helper()
+	ln, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		buf := make([]byte, 32*1024)
+		for {
+			ln.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, addr, rErr := ln.ReadFromUDP(buf)
+			if rErr != nil {
+				select {
+				case <-done:
+					return
+				default:
+					continue
+				}
+			}
+			if n > 0 {
+				packet := make([]byte, n)
+				copy(packet, buf[:n])
+				ln.WriteToUDP(packet, addr)
+			}
+		}
+	}()
+	return ln, done
+}
+
+func TestE2EUDPForward(t *testing.T) {
+	echoLn, done := startUDPEcho(t)
+	defer close(done)
+	defer echoLn.Close()
+
+	proxy, err := relay.NewUDPProxy("127.0.0.1:0", echoLn.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	go proxy.Serve()
+	defer proxy.Close()
+
+	client, err := net.Dial("udp", proxy.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	payload := randomBytes(1000)
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, len(payload))
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := client.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf[:n], payload) {
+		t.Fatalf("udp echo mismatch: got %d bytes", n)
+	}
+}
+
+// ─── 3. SOCKS5 E2E ──────────────────────────────────────────────────────
 
 func TestE2ESocks5(t *testing.T) {
 	echoLn, done := startEcho(t)
@@ -763,7 +918,8 @@ func TestE2ELocalProxyTLSCustomCert(t *testing.T) {
 	}()
 
 	// SetupTLS with custom cert and verify=true -> Insecure=false
-	srvCfg, err := relay.SetupTLS("/tmp/test-srv.pem", "/tmp/test-srv-key.pem", true)
+	certFile, keyFile, caFile := writeTestCertFiles(t)
+	srvCfg, err := relay.SetupTLS(certFile, keyFile, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -776,7 +932,7 @@ func TestE2ELocalProxyTLSCustomCert(t *testing.T) {
 	defer proxy.Close()
 
 	// Dial with the CA cert in the root pool — verification must pass
-	caCert, err := os.ReadFile("/tmp/test-ca.pem")
+	caCert, err := os.ReadFile(caFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -818,4 +974,161 @@ func findFreePort(t *testing.T) uint16 {
 	port := uint16(ln.Addr().(*net.TCPAddr).Port)
 	ln.Close()
 	return port
+}
+
+// TestE2ERemoteForwardWithBind proves that a remote forward can be bound to a
+// specific address on the server (e.g. 127.0.0.1) instead of the default 0.0.0.0.
+func TestE2ERemoteForwardWithBind(t *testing.T) {
+	echoLn, done := startEcho(t)
+	defer echoLn.Close()
+
+	srv, err := relay.NewRemoteServer("127.0.0.1:0", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srv.Serve()
+	defer srv.Close()
+
+	remotePort := findFreePort(t)
+	tunnels := []relay.RemoteTunnel{
+		{RemotePort: remotePort, BindAddr: "127.0.0.1", TargetAddr: echoLn.Addr().String()},
+	}
+	client := relay.NewRemoteClient(srv.Addr().String(), "", nil, tunnels)
+	go client.Run()
+	defer client.Close()
+
+	time.Sleep(300 * time.Millisecond)
+
+	payload := randomBytes(10000)
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", remotePort))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn.Write(payload)
+	halfCloseTCP(conn)
+
+	got, err := io.ReadAll(conn)
+	conn.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("remote forward with bind: got %d bytes, want %d", len(got), len(payload))
+	}
+}
+
+// TestE2ERemoteTLSFingerprintAndTOFU exercises persistent auto-TLS identities
+// and fingerprint verification in the remote forwarding path. It verifies:
+//   - a client with the correct --server-fingerprint connects;
+//   - a client with a wrong fingerprint is rejected;
+//   - trust-on-first-use records a server identity and rejects it when it changes.
+func TestE2ERemoteTLSFingerprintAndTOFU(t *testing.T) {
+	echoLn := startEchoLoop(t)
+	defer echoLn.Close()
+
+	origIdentityDir := relay.DefaultIdentityDir
+	defer func() { relay.DefaultIdentityDir = origIdentityDir }()
+
+	// Server A identity.
+	dirA := filepath.Join(t.TempDir(), "identity-a")
+	relay.DefaultIdentityDir = dirA
+	srvCfgA, err := relay.SetupTLS("", "", false)
+	if err != nil {
+		t.Fatalf("setup server A tls: %v", err)
+	}
+	srvA, err := relay.NewRemoteServer("127.0.0.1:0", "", srvCfgA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srvA.Serve()
+	defer srvA.Close()
+	serverAddr := srvA.Addr().String()
+
+	remotePort := findFreePort(t)
+	tunnels := []relay.RemoteTunnel{
+		{RemotePort: remotePort, TargetAddr: echoLn.Addr().String()},
+	}
+	remoteAddr := fmt.Sprintf("127.0.0.1:%d", remotePort)
+
+	// Correct pinned fingerprint.
+	pinCfg := &relay.TLSConfig{Enabled: true, ServerFingerprint: srvCfgA.Fingerprint}
+	clientPin := relay.NewRemoteClient(serverAddr, "", pinCfg, tunnels)
+	go clientPin.Run()
+	if _, err := waitEcho(remoteAddr, randomBytes(256), 5*time.Second); err != nil {
+		t.Fatalf("correct fingerprint did not connect: %v", err)
+	}
+	clientPin.Close()
+
+	// Wrong pinned fingerprint: should never connect.
+	badPinCfg := &relay.TLSConfig{Enabled: true, ServerFingerprint: "SHA256:BBBBBBBBBBBB"}
+	clientBad := relay.NewRemoteClient(serverAddr, "", badPinCfg, tunnels)
+	go clientBad.Run()
+	time.Sleep(700 * time.Millisecond)
+	if clientBad.IsConnected() {
+		t.Fatal("client with wrong fingerprint should not be connected")
+	}
+	clientBad.Close()
+
+	// TOFU first connect.
+	khPath := filepath.Join(t.TempDir(), "known_hosts")
+	kh, err := relay.LoadKnownHosts(khPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tofuCfg := &relay.TLSConfig{Enabled: true, TrustOnFirstUse: true, KnownHosts: kh}
+	clientTofu1 := relay.NewRemoteClient(serverAddr, "", tofuCfg, tunnels)
+	go clientTofu1.Run()
+	if _, err := waitEcho(remoteAddr, randomBytes(256), 5*time.Second); err != nil {
+		t.Fatalf("TOFU first connect failed: %v", err)
+	}
+	clientTofu1.Close()
+
+	// Wait for the public listener to close so the next client can rebind.
+	if err := waitPortFree(remotePort, 3*time.Second); err != nil {
+		t.Fatalf("public listener did not free port: %v", err)
+	}
+
+	// Stop server A and start server B with a different identity on the same address.
+	srvA.Close()
+	if err := waitPortFree(uint16(netAddrPort(t, serverAddr)), 3*time.Second); err != nil {
+		t.Fatalf("server A control port not freed: %v", err)
+	}
+
+	dirB := filepath.Join(t.TempDir(), "identity-b")
+	relay.DefaultIdentityDir = dirB
+	srvCfgB, err := relay.SetupTLS("", "", false)
+	if err != nil {
+		t.Fatalf("setup server B tls: %v", err)
+	}
+	srvB, err := relay.NewRemoteServer(serverAddr, "", srvCfgB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srvB.Serve()
+	defer srvB.Close()
+
+	// Reconnect with the same known_hosts and TOFU: it must reject the changed identity.
+	clientTofu2 := relay.NewRemoteClient(serverAddr, "", tofuCfg, tunnels)
+	go clientTofu2.Run()
+	time.Sleep(700 * time.Millisecond)
+	if clientTofu2.IsConnected() {
+		t.Fatal("TOFU client should reject changed server identity")
+	}
+	clientTofu2.Close()
+}
+
+func netAddrPort(t *testing.T, addr string) uint16 {
+	t.Helper()
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("bad addr %q: %v", addr, err)
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return uint16(p)
 }

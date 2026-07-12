@@ -5,8 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -15,6 +18,8 @@ import (
 	"tunnel/manager"
 	"tunnel/relay"
 )
+
+var knownHosts *relay.KnownHosts
 
 func main() {
 	localF := flag.String("L", "", "Local forwarding: [bind:]port:host:hostport")
@@ -26,25 +31,31 @@ func main() {
 	tlsCertF := flag.String("tls-cert", "", "TLS certificate file (PEM)")
 	tlsKeyF := flag.String("tls-key", "", "TLS key file (PEM)")
 	tlsVerifyF := flag.Bool("tls-verify", false, "Verify TLS peer certificate (requires trusted CA)")
+	tlsTrustOnFirstUseF := flag.Bool("trust-on-first-use", false, "Trust and remember server certificate fingerprint on first connect (remote client)")
+	tlsServerFingerprintF := flag.String("server-fingerprint", "", "Pinned server certificate fingerprint SHA256:... (remote client)")
 	udpF := flag.Bool("udp", false, "Use UDP instead of TCP")
+	socksUserF := flag.String("socks-user", "", "SOCKS5 username (for -D)")
+	socksPassF := flag.String("socks-pass", "", "SOCKS5 password (for -D)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Tunnel - port forwarding tool
 
 FORWARDING MODES (ad-hoc):
 
-  tunnel -L [bind:]port:host:hostport
-        Local TCP forwarding, like ssh -L.
+  tunnel -L [bind:]port:host:hostport [--udp]
+        Local TCP/UDP forwarding, like ssh -L.
         Forward a local port to a remote target.
         Examples:
-          tunnel -L 3306:db.internal:3306         # mysql
-          tunnel -L 0.0.0.0:8080:web:80            # bind all interfaces
+          tunnel -L 3306:db.internal:3306         # mysql (TCP)
+          tunnel -L 0.0.0.0:8080:web:80            # bind all interfaces (TCP)
+          tunnel -L 127.0.0.1:53:8.8.8.8:53 --udp  # DNS (UDP)
 
   tunnel -D port
         Dynamic SOCKS5 proxy, like ssh -D.
         Start a SOCKS5 proxy on the given port.
-        Example:
-          tunnel -D 1080                           # curl --socks5 127.0.0.1:1080
+        Examples:
+          tunnel -D 1080                           # no-auth proxy
+          tunnel -D 1080 --socks-user u --socks-pass p  # authenticated proxy
 
   tunnel -R port:host:hostport -s server:port
         Remote TCP forwarding (NAT穿透), like ssh -R.
@@ -58,11 +69,13 @@ TLS ENCRYPTION (all forwarding modes):
   --tls                            Enable TLS 1.3 (auto-generates self-signed cert)
   --tls-cert <file> --tls-key <file>  Use real PEM cert+key instead of auto-generating
   --tls-verify                     Verify peer certificate (requires trusted CA)
+  --server-fingerprint SHA256:...  Pin the remote server identity (no CA needed)
+  --trust-on-first-use             Remember server fingerprint on first connect
 
   Examples:
     tunnel -L 8080:web:80 --tls                           # self-signed, skip verify
     tunnel -L 443:web:443 --tls --tls-cert cert.pem --tls-key key.pem --tls-verify
-    tunnel -R 9090:localhost:8080 -s vps:9000 --tls --tls-verify
+    tunnel -R 9090:localhost:8080 -s vps:9000 --tls --server-fingerprint SHA256:...
 
 AUTH TOKEN (remote forwarding):
 
@@ -78,6 +91,12 @@ DAEMON MODE (managed tunnels via YAML config):
   tunnel add -L/-R/-D ... [--name X]  Add and start a tunnel
   tunnel rm <name>                 Remove a tunnel
   tunnel reload                    Hot-reload ~/.config/tunnel/config.yaml
+  tunnel enable <name>             Enable autostart and start a tunnel
+  tunnel disable <name>            Disable autostart and stop a tunnel
+  tunnel restart <name>            Restart a tunnel
+  tunnel save                      Persist current runtime config to disk
+  tunnel status <name>             Show detailed status of a tunnel
+  tunnel logs <name> [--lines N]   Show recent log lines for a tunnel
   tunnel start-group <group>       Start all tunnels in a group
   tunnel stop-group <group>        Stop all tunnels in a group
 
@@ -133,6 +152,18 @@ OTHER FLAGS:
 		cmdAdd()
 	case "rm", "remove":
 		cmdRemove()
+	case "enable":
+		cmdEnable()
+	case "disable":
+		cmdDisable()
+	case "restart":
+		cmdRestart()
+	case "save":
+		cmdSave()
+	case "status":
+		cmdStatus()
+	case "logs":
+		cmdLogs()
 	case "init":
 		cmdInit()
 	case "reload":
@@ -145,11 +176,15 @@ OTHER FLAGS:
 		flag.CommandLine.Parse(os.Args[1:])
 		switch {
 		case *localF != "":
-			runAdhocLocal(*localF, *tlsF, *tlsCertF, *tlsKeyF, *tlsVerifyF, *udpF)
+			protocol := "tcp"
+			if *udpF {
+				protocol = "udp"
+			}
+			runAdhocLocal(*localF, protocol, *tlsF, *tlsCertF, *tlsKeyF, *tlsVerifyF)
 		case *dynamicF != "":
-			runAdhocDynamic(*dynamicF)
+			runAdhocDynamic(*dynamicF, *socksUserF, *socksPassF)
 		case *remoteF != "" && *serverF != "":
-			runAdhocRemote(*remoteF, *serverF, *tokenF, *tlsF, *tlsCertF, *tlsKeyF, *tlsVerifyF)
+			runAdhocRemote(*remoteF, *serverF, *tokenF, *tlsF, *tlsCertF, *tlsKeyF, *tlsVerifyF, *tlsTrustOnFirstUseF, *tlsServerFingerprintF)
 		case *remoteF == "" && *serverF != "":
 			runAdhocRemoteServer(*serverF, *tokenF, *tlsF, *tlsCertF, *tlsKeyF, *tlsVerifyF)
 		default:
@@ -217,9 +252,21 @@ func cmdList() {
 		fmt.Println("No tunnels configured.")
 		return
 	}
-	fmt.Printf("%-20s %-8s %-22s %-22s %s\n", "NAME", "MODE", "LOCAL", "REMOTE", "STATUS")
+	fmt.Printf("%-20s %-8s %-22s %-22s %-14s %-10s %s\n", "NAME", "MODE", "LOCAL", "REMOTE", "STATUS", "SINCE", "RECONNECTS")
 	for _, s := range statuses {
-		fmt.Printf("%-20s %-8s %-22s %-22s %s\n", s.Name, s.Mode, s.Local, s.Remote, s.Status)
+		since := ""
+		if !s.Since.IsZero() {
+			since = time.Since(s.Since).Round(time.Second).String()
+		}
+		reconnects := ""
+		if s.ReconnectCount > 0 {
+			reconnects = strconv.FormatInt(s.ReconnectCount, 10)
+		}
+		status := s.Status
+		if s.Error != "" {
+			status = fmt.Sprintf("%s (%s)", status, s.Error)
+		}
+		fmt.Printf("%-20s %-8s %-22s %-22s %-14s %-10s %s\n", s.Name, s.Mode, s.Local, s.Remote, status, since, reconnects)
 	}
 }
 
@@ -236,12 +283,29 @@ func cmdAdd() {
 	tlsVerify := subFlags.Bool("tls-verify", false, "Verify TLS peer (for -R)")
 	tlsCert := subFlags.String("tls-cert", "", "TLS cert file (for -R)")
 	tlsKey := subFlags.String("tls-key", "", "TLS key file (for -R)")
+	tlsTrustOnFirstUse := subFlags.Bool("trust-on-first-use", false, "Trust server fingerprint on first connect (for -R)")
+	tlsServerFingerprint := subFlags.String("server-fingerprint", "", "Pinned server fingerprint SHA256:... (for -R)")
+	socksUser := subFlags.String("socks-user", "", "SOCKS5 username (for -D)")
+	socksPass := subFlags.String("socks-pass", "", "SOCKS5 password (for -D)")
+	udp := subFlags.Bool("udp", false, "Use UDP (for -L)")
+	group := subFlags.String("group", "", "Tunnel group")
+	autostart := subFlags.Bool("autostart", true, "Autostart tunnel")
 	subFlags.Parse(subArgs)
+
+	protocol := "tcp"
+	if *udp {
+		protocol = "udp"
+	}
 
 	tc, err := buildTunnelConfig(addParams{
 		local: *l, remote: *r, dynamic: *d, name: *name,
 		server: *server, token: *token,
 		tls: *tlsF, tlsVerify: *tlsVerify, tlsCert: *tlsCert, tlsKey: *tlsKey,
+		tlsTrustOnFirstUse: *tlsTrustOnFirstUse, tlsServerFingerprint: *tlsServerFingerprint,
+		socksUser: *socksUser, socksPass: *socksPass,
+		protocol:  protocol,
+		group:     *group,
+		autostart: *autostart,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -258,6 +322,12 @@ type addParams struct {
 	server, token                string
 	tls, tlsVerify               bool
 	tlsCert, tlsKey              string
+	tlsTrustOnFirstUse           bool
+	tlsServerFingerprint         string
+	socksUser, socksPass         string
+	protocol                     string
+	group                        string
+	autostart                    bool
 }
 
 // buildTunnelConfig turns `tunnel add` flags into a TunnelConfig. It supports
@@ -273,6 +343,7 @@ func buildTunnelConfig(p addParams) (manager.TunnelConfig, error) {
 		}
 		tc.Local = listen
 		tc.Remote = target
+		tc.Protocol = p.protocol
 		tc.Name = defaultName(p.name, "local-"+p.local)
 	case p.remote != "":
 		if p.server == "" {
@@ -286,15 +357,20 @@ func buildTunnelConfig(p addParams) (manager.TunnelConfig, error) {
 		tc.TLSVerify = p.tlsVerify
 		tc.TLSCert = p.tlsCert
 		tc.TLSKey = p.tlsKey
+		tc.TLSTrustOnFirstUse = p.tlsTrustOnFirstUse
+		tc.TLSServerFingerprint = p.tlsServerFingerprint
 		tc.Name = defaultName(p.name, "remote-"+p.remote)
 	case p.dynamic != "":
 		tc.Mode = "dynamic"
 		tc.Local = normalizeListenAddr(p.dynamic)
+		tc.SocksUser = p.socksUser
+		tc.SocksPass = p.socksPass
 		tc.Name = defaultName(p.name, "dynamic-"+p.dynamic)
 	default:
 		return tc, fmt.Errorf("specify -L, -R, or -D")
 	}
-	tc.Autostart = true
+	tc.Group = p.group
+	tc.Autostart = p.autostart
 	return tc, nil
 }
 
@@ -322,6 +398,122 @@ func cmdRemove() {
 		log.Fatalf("remove: %v", err)
 	}
 	fmt.Printf("Tunnel %q removed.\n", name)
+}
+
+func cmdEnable() {
+	if len(os.Args) < 3 {
+		log.Fatal("usage: tunnel enable <name>")
+	}
+	name := os.Args[2]
+	_, err := manager.SendControl("enable", map[string]string{"name": name})
+	if err != nil {
+		log.Fatalf("enable: %v", err)
+	}
+	fmt.Printf("Tunnel %q enabled.\n", name)
+}
+
+func cmdDisable() {
+	if len(os.Args) < 3 {
+		log.Fatal("usage: tunnel disable <name>")
+	}
+	name := os.Args[2]
+	_, err := manager.SendControl("disable", map[string]string{"name": name})
+	if err != nil {
+		log.Fatalf("disable: %v", err)
+	}
+	fmt.Printf("Tunnel %q disabled.\n", name)
+}
+
+func cmdRestart() {
+	if len(os.Args) < 3 {
+		log.Fatal("usage: tunnel restart <name>")
+	}
+	name := os.Args[2]
+	_, err := manager.SendControl("restart", map[string]string{"name": name})
+	if err != nil {
+		log.Fatalf("restart: %v", err)
+	}
+	fmt.Printf("Tunnel %q restarted.\n", name)
+}
+
+func cmdSave() {
+	_, err := manager.SendControl("save", nil)
+	if err != nil {
+		log.Fatalf("save: %v", err)
+	}
+	fmt.Println("Config saved.")
+}
+
+func cmdStatus() {
+	if len(os.Args) < 3 {
+		// Summary mode: count total/running/stopped.
+		result, err := manager.SendControl("list", nil)
+		if err != nil {
+			log.Fatalf("status: %v", err)
+		}
+		var statuses []manager.TunnelStatus
+		if err := json.Unmarshal(result, &statuses); err != nil {
+			log.Fatalf("parse status: %v", err)
+		}
+		running := 0
+		for _, s := range statuses {
+			if s.Status != "stopped" {
+				running++
+			}
+		}
+		fmt.Printf("%d tunnels configured, %d running, %d stopped\n", len(statuses), running, len(statuses)-running)
+		return
+	}
+
+	name := os.Args[2]
+	result, err := manager.SendControl("status", map[string]string{"name": name})
+	if err != nil {
+		log.Fatalf("status: %v", err)
+	}
+	var st manager.TunnelStatus
+	if err := json.Unmarshal(result, &st); err != nil {
+		log.Fatalf("parse status: %v", err)
+	}
+	fmt.Printf("Name:    %s\n", st.Name)
+	fmt.Printf("Mode:    %s\n", st.Mode)
+	fmt.Printf("Local:   %s\n", st.Local)
+	fmt.Printf("Remote:  %s\n", st.Remote)
+	fmt.Printf("Group:   %s\n", st.Group)
+	fmt.Printf("Status:  %s\n", st.Status)
+	if !st.Since.IsZero() {
+		fmt.Printf("Since:   %s\n", time.Since(st.Since).Round(time.Second))
+	}
+	if st.ReconnectCount > 0 {
+		fmt.Printf("Reconnects: %d\n", st.ReconnectCount)
+	}
+	if st.Error != "" {
+		fmt.Printf("Error:   %s\n", st.Error)
+	}
+}
+
+func cmdLogs() {
+	subFlags := flag.NewFlagSet("logs", flag.ExitOnError)
+	linesF := subFlags.Int("lines", 100, "Number of recent log lines to show")
+	if err := subFlags.Parse(os.Args[2:]); err != nil {
+		log.Fatalf("logs: %v", err)
+	}
+	name := subFlags.Arg(0)
+
+	result, err := manager.SendControl("logs", map[string]any{"name": name, "lines": *linesF})
+	if err != nil {
+		log.Fatalf("logs: %v", err)
+	}
+	var lines []string
+	if err := json.Unmarshal(result, &lines); err != nil {
+		log.Fatalf("parse logs: %v", err)
+	}
+	if len(lines) == 0 {
+		fmt.Println("No log lines available.")
+		return
+	}
+	for _, line := range lines {
+		fmt.Println(line)
+	}
 }
 
 // ─── New commands ───────────────────────────────────────────────────
@@ -387,6 +579,7 @@ func runDaemon(cfg *manager.Config) {
 			defer f.Close()
 		}
 	}
+	manager.InstallLogCapture()
 
 	if err := manager.WritePidfile(); err != nil {
 		log.Fatalf("pidfile: %v", err)
@@ -445,90 +638,150 @@ func runDaemon(cfg *manager.Config) {
 
 // applyGlobalConfig loads the config (best-effort) and applies process-wide
 // settings that the daemon and CLI clients must agree on — currently a custom
-// control socket path. Errors are ignored so commands still work with defaults.
+// control socket path, the persistent TLS identity directory, and the known_hosts
+// path. Errors are ignored so commands still work with defaults.
 func applyGlobalConfig() {
 	cfg, err := manager.LoadConfig("")
 	if err != nil {
+		initTLSPaths()
 		return
 	}
 	if cfg.Global.ControlSocket != "" {
 		manager.SetControlSocketPath(cfg.Global.ControlSocket)
 	}
+	initTLSPaths()
+}
+
+func initTLSPaths() {
+	relay.DefaultIdentityDir = filepath.Join(manager.DefaultConfigDir, "identity")
+	kh, _ := relay.LoadKnownHosts(filepath.Join(manager.DefaultConfigDir, "known_hosts"))
+	knownHosts = kh
 }
 
 // ─── Ad-hoc mode helpers ─────────────────────────────────────────────
 
+// forwardSpec holds the pieces of a [bind:]port:host:hostport forwarding spec.
+type forwardSpec struct {
+	bind     string // empty means default bind will be applied
+	port     uint16 // listen (local) or remote port
+	host     string // target host
+	hostPort uint16 // target port
+}
+
+// parseForwardSpec parses a forwarding spec of the form [bind:]port:host:hostport.
+// If allowBind is false and a bind prefix is present, it returns an error.
+// IPv6 literals are not supported and are rejected.
+func parseForwardSpec(spec, defaultBind string, allowBind bool) (forwardSpec, error) {
+	if spec == "" {
+		return forwardSpec{}, fmt.Errorf("empty forwarding spec")
+	}
+	if strings.ContainsAny(spec, "[]") {
+		return forwardSpec{}, fmt.Errorf("IPv6 literals are not supported: %q", spec)
+	}
+
+	// Split from the right: port:host:hostport.
+	// First rightmost colon separates host and hostPort.
+	hostPortSep := strings.LastIndexByte(spec, ':')
+	if hostPortSep < 0 {
+		return forwardSpec{}, fmt.Errorf("invalid format %q (expected [bind:]port:host:hostport)", spec)
+	}
+	hostPortStr := spec[hostPortSep+1:]
+	mid := spec[:hostPortSep]
+
+	// Second rightmost colon separates port and host.
+	portHostSep := strings.LastIndexByte(mid, ':')
+	if portHostSep < 0 {
+		return forwardSpec{}, fmt.Errorf("invalid format %q (expected [bind:]port:host:hostport)", spec)
+	}
+	host := mid[portHostSep+1:]
+	front := mid[:portHostSep]
+
+	// Front is [bind:]port.
+	bindSep := strings.LastIndexByte(front, ':')
+	portStr := front
+	var bind string
+	if bindSep >= 0 {
+		bind = front[:bindSep]
+		portStr = front[bindSep+1:]
+	}
+
+	if host == "" {
+		return forwardSpec{}, fmt.Errorf("invalid format %q: target host is empty", spec)
+	}
+	if bind != "" && !allowBind {
+		return forwardSpec{}, fmt.Errorf("invalid format %q: bind prefix is not supported for this mode", spec)
+	}
+	if bind == "" {
+		bind = defaultBind
+	}
+
+	port, err := parsePort(portStr)
+	if err != nil {
+		return forwardSpec{}, fmt.Errorf("invalid listen port in %q: %w", spec, err)
+	}
+	hostPort, err := parsePort(hostPortStr)
+	if err != nil {
+		return forwardSpec{}, fmt.Errorf("invalid target port in %q: %w", spec, err)
+	}
+
+	return forwardSpec{bind: bind, port: port, host: host, hostPort: hostPort}, nil
+}
+
+func parsePort(s string) (uint16, error) {
+	if s == "" {
+		return 0, fmt.Errorf("port is empty")
+	}
+	p, err := strconv.ParseUint(s, 10, 16)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a valid port", s)
+	}
+	return uint16(p), nil
+}
+
 func parseLocalSpec(spec string) (listenAddr, dialAddr string, err error) {
-	hostPort := ""
-	for i := len(spec) - 1; i >= 0; i-- {
-		if spec[i] == ':' {
-			if hostPort == "" {
-				hostPort = spec[i+1:]
-				spec = spec[:i]
-			} else {
-				dialAddr = spec[i+1:] + ":" + hostPort
-				spec = spec[:i]
-				break
-			}
-		}
+	fs, err := parseForwardSpec(spec, "127.0.0.1", true)
+	if err != nil {
+		return "", "", err
 	}
-	if dialAddr == "" {
-		return "", "", fmt.Errorf("invalid -L format: %q (expected [bind:]port:host:hostport)", spec+":"+hostPort)
-	}
-	lastColon := -1
-	for i := len(spec) - 1; i >= 0; i-- {
-		if spec[i] == ':' {
-			lastColon = i
-			break
-		}
-	}
-	if lastColon >= 0 {
-		listenAddr = spec[:lastColon] + ":" + spec[lastColon+1:]
-	} else {
-		listenAddr = "127.0.0.1:" + spec
-	}
-	return listenAddr, dialAddr, nil
+	return net.JoinHostPort(fs.bind, strconv.Itoa(int(fs.port))),
+		net.JoinHostPort(fs.host, strconv.Itoa(int(fs.hostPort))), nil
 }
 
-func parseRemoteSpec(spec string) (remotePort uint16, targetAddr string, err error) {
-	hostPort := ""
-	for i := len(spec) - 1; i >= 0; i-- {
-		if spec[i] == ':' {
-			if hostPort == "" {
-				hostPort = spec[i+1:]
-				spec = spec[:i]
-			} else {
-				targetAddr = spec[i+1:] + ":" + hostPort
-				spec = spec[:i]
-				break
-			}
-		}
+func parseRemoteSpec(spec string) (bind string, remotePort uint16, targetAddr string, err error) {
+	fs, err := parseForwardSpec(spec, "0.0.0.0", true)
+	if err != nil {
+		return "", 0, "", err
 	}
-	if targetAddr == "" {
-		return 0, "", fmt.Errorf("invalid -R format: %q (expected [bind:]port:host:hostport)", spec+":"+hostPort)
-	}
-	lastColon := -1
-	for i := len(spec) - 1; i >= 0; i-- {
-		if spec[i] == ':' {
-			lastColon = i
-			break
-		}
-	}
-	portStr := spec
-	if lastColon >= 0 {
-		portStr = spec[lastColon+1:]
-	}
-	var p int
-	for _, c := range portStr {
-		p = p*10 + int(c-'0')
-	}
-	return uint16(p), targetAddr, nil
+	return fs.bind, fs.port, net.JoinHostPort(fs.host, strconv.Itoa(int(fs.hostPort))), nil
 }
 
-func runAdhocLocal(spec string, tls bool, tlsCert, tlsKey string, tlsVerify bool, udp bool) {
-	if udp {
-		log.Fatal("UDP forwarding not yet implemented")
+func runAdhocLocal(spec, protocol string, tls bool, tlsCert, tlsKey string, tlsVerify bool) {
+	if protocol == "udp" {
+		if tls {
+			log.Fatal("TLS is not supported with UDP forwarding")
+		}
+		listenAddr, dialAddr, err := parseLocalSpec(spec)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("UDP listening on %s, forwarding to %s", listenAddr, dialAddr)
+		proxy, err := relay.NewUDPProxy(listenAddr, dialAddr)
+		if err != nil {
+			log.Fatalf("Failed to start UDP proxy: %v", err)
+		}
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			sig := <-sigCh
+			log.Printf("Received %v, shutting down...", sig)
+			proxy.Close()
+		}()
+		if err := proxy.Serve(); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
+
 	listenAddr, dialAddr, err := parseLocalSpec(spec)
 	if err != nil {
 		log.Fatal(err)
@@ -559,8 +812,8 @@ func runAdhocLocal(spec string, tls bool, tlsCert, tlsKey string, tlsVerify bool
 	}
 }
 
-func runAdhocRemote(remoteSpec, serverAddr, token string, tls bool, tlsCert, tlsKey string, tlsVerify bool) {
-	remotePort, targetAddr, err := parseRemoteSpec(remoteSpec)
+func runAdhocRemote(remoteSpec, serverAddr, token string, tls bool, tlsCert, tlsKey string, tlsVerify bool, trustOnFirstUse bool, serverFingerprint string) {
+	bind, remotePort, targetAddr, err := parseRemoteSpec(remoteSpec)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -571,13 +824,16 @@ func runAdhocRemote(remoteSpec, serverAddr, token string, tls bool, tlsCert, tls
 		if err != nil {
 			log.Fatalf("TLS setup: %v", err)
 		}
+		tlsCfg.TrustOnFirstUse = trustOnFirstUse
+		tlsCfg.ServerFingerprint = serverFingerprint
+		tlsCfg.KnownHosts = knownHosts
 	}
 
 	tunnels := []relay.RemoteTunnel{
-		{RemotePort: remotePort, TargetAddr: targetAddr},
+		{RemotePort: remotePort, BindAddr: bind, TargetAddr: targetAddr},
 	}
 
-	log.Printf("Remote tunnel: %s:%d -> %s (via %s)", "0.0.0.0", remotePort, targetAddr, serverAddr)
+	log.Printf("Remote tunnel: %s:%d -> %s (via %s)", bind, remotePort, targetAddr, serverAddr)
 	client := relay.NewRemoteClient(serverAddr, token, tlsCfg, tunnels)
 
 	sigCh := make(chan os.Signal, 1)
@@ -598,6 +854,9 @@ func runAdhocRemoteServer(serverAddr, token string, tls bool, tlsCert, tlsKey st
 		tlsCfg, err = relay.SetupTLS(tlsCert, tlsKey, tlsVerify)
 		if err != nil {
 			log.Fatalf("TLS setup: %v", err)
+		}
+		if tlsCfg.Fingerprint != "" {
+			log.Printf("Remote server TLS identity fingerprint: %s", tlsCfg.Fingerprint)
 		}
 	}
 
@@ -622,14 +881,14 @@ func runAdhocRemoteServer(serverAddr, token string, tls bool, tlsCert, tlsKey st
 	srv.Wait()
 }
 
-func runAdhocDynamic(portSpec string) {
-	listenAddr := portSpec
-	if portSpec[0] != ':' {
-		listenAddr = "127.0.0.1:" + portSpec
+func runAdhocDynamic(portSpec, user, pass string) {
+	if portSpec == "" {
+		log.Fatal("dynamic port cannot be empty")
 	}
+	listenAddr := normalizeListenAddr(portSpec)
 
 	log.Printf("SOCKS5 proxy on %s", listenAddr)
-	proxy, err := relay.NewSocksProxy(listenAddr)
+	proxy, err := relay.NewSocksProxyWithAuth(listenAddr, user, pass)
 	if err != nil {
 		log.Fatalf("Failed to start SOCKS proxy: %v", err)
 	}

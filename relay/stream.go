@@ -3,6 +3,7 @@ package relay
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -17,6 +18,15 @@ const (
 	chClosed
 )
 
+const (
+	// defaultSendWindow is the initial per-channel send credit. The receiver
+	// replenishes it with FrameWindowUpdate as it consumes data.
+	defaultSendWindow = 64 * 1024
+	// maxReceiveBuffer caps inbound data buffered per channel. It is a safety
+	// net; normal operation relies on the send window for back-pressure.
+	maxReceiveBuffer = 256 * 1024
+)
+
 // channel implements net.Conn over a multiplexed control connection.
 type channel struct {
 	id     uint32
@@ -28,11 +38,16 @@ type channel struct {
 	status channelStatus
 	cmu    sync.Mutex
 	rerr   error
+
+	sendWindow int64
+	wmu        sync.Mutex
+	wcond      *sync.Cond
 }
 
 func newChannel(id uint32, ctrl *CtrlConn, target string) *channel {
-	ch := &channel{id: id, ctrl: ctrl, target: target}
+	ch := &channel{id: id, ctrl: ctrl, target: target, sendWindow: defaultSendWindow}
 	ch.rcond = sync.NewCond(&ch.rmu)
+	ch.wcond = sync.NewCond(&ch.wmu)
 	return ch
 }
 
@@ -51,7 +66,11 @@ func (ch *channel) Read(b []byte) (int, error) {
 		}
 		ch.rcond.Wait()
 	}
-	return ch.rb.Read(b)
+	n, err := ch.rb.Read(b)
+	if n > 0 {
+		ch.sendWindowUpdate(n)
+	}
+	return n, err
 }
 
 func (ch *channel) Write(b []byte) (int, error) {
@@ -62,13 +81,37 @@ func (ch *channel) Write(b []byte) (int, error) {
 	}
 	ch.cmu.Unlock()
 
-	payload := make([]byte, 4+len(b))
-	binary.BigEndian.PutUint32(payload[:4], ch.id)
-	copy(payload[4:], b)
-	if err := ch.ctrl.sendFrame(FrameChannelData, payload); err != nil {
-		return 0, err
+	total := 0
+	for len(b) > 0 {
+		ch.wmu.Lock()
+		for ch.sendWindow <= 0 {
+			ch.cmu.Lock()
+			s := ch.status
+			ch.cmu.Unlock()
+			if s >= chWriteClosed {
+				ch.wmu.Unlock()
+				return total, io.ErrClosedPipe
+			}
+			ch.wcond.Wait()
+		}
+
+		chunk := b
+		if int64(len(chunk)) > ch.sendWindow {
+			chunk = b[:ch.sendWindow]
+		}
+		ch.sendWindow -= int64(len(chunk))
+		ch.wmu.Unlock()
+
+		payload := make([]byte, 4+len(chunk))
+		binary.BigEndian.PutUint32(payload[:4], ch.id)
+		copy(payload[4:], chunk)
+		if err := ch.ctrl.sendFrame(FrameChannelData, payload); err != nil {
+			return total, err
+		}
+		total += len(chunk)
+		b = b[len(chunk):]
 	}
-	return len(b), nil
+	return total, nil
 }
 
 func (ch *channel) CloseWrite() error {
@@ -98,6 +141,10 @@ func (ch *channel) Close() error {
 	ch.rcond.Broadcast()
 	ch.rmu.Unlock()
 
+	ch.wmu.Lock()
+	ch.wcond.Broadcast()
+	ch.wmu.Unlock()
+
 	// A fully-closed channel is done in both directions; drop it from the
 	// multiplexer so the channel map does not grow per handled connection.
 	ch.ctrl.removeChannel(ch.id)
@@ -115,9 +162,17 @@ func (ch *channel) SetWriteDeadline(time.Time) error { return nil }
 
 func (ch *channel) pushData(data []byte) {
 	ch.rmu.Lock()
+	defer ch.rmu.Unlock()
+	if ch.rb.Len()+len(data) > maxReceiveBuffer {
+		// Safety net: the peer sent more than the receive buffer allows despite
+		// the send window. Tear down the channel rather than unbounded growth.
+		ch.rerr = fmt.Errorf("receive buffer overflow")
+		ch.rcond.Broadcast()
+		go ch.Close()
+		return
+	}
 	ch.rb.Write(data)
 	ch.rcond.Broadcast()
-	ch.rmu.Unlock()
 }
 
 func (ch *channel) setError(err error) {
@@ -125,4 +180,18 @@ func (ch *channel) setError(err error) {
 	ch.rerr = err
 	ch.rcond.Broadcast()
 	ch.rmu.Unlock()
+}
+
+func (ch *channel) addSendWindow(delta int64) {
+	ch.wmu.Lock()
+	ch.sendWindow += delta
+	ch.wcond.Broadcast()
+	ch.wmu.Unlock()
+}
+
+func (ch *channel) sendWindowUpdate(delta int) {
+	payload := make([]byte, 4+4)
+	binary.BigEndian.PutUint32(payload[:4], ch.id)
+	binary.BigEndian.PutUint32(payload[4:], uint32(delta))
+	ch.ctrl.sendFrame(FrameWindowUpdate, payload)
 }

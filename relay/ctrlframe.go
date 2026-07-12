@@ -15,6 +15,11 @@ const (
 	FrameAuthRequest  byte = 0x06
 	FrameAuthResponse byte = 0x07
 	FrameRegister     byte = 0x08
+	FrameWindowUpdate byte = 0x09
+
+	// maxFramePayload is the largest payload ReadFrame will accept.
+	// It matches the limit enforced by WriteFrame.
+	maxFramePayload = 1 << 24 // ~16 MB
 )
 
 type Frame struct {
@@ -29,6 +34,9 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	}
 	length := binary.BigEndian.Uint32(header[:4])
 	typ := header[4]
+	if length > maxFramePayload {
+		return Frame{}, fmt.Errorf("frame payload too large: %d", length)
+	}
 	payload := make([]byte, length)
 	if length > 0 {
 		if _, err := io.ReadFull(r, payload); err != nil {
